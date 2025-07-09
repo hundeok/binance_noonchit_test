@@ -1,0 +1,250 @@
+name: binance_noonchit_test
+description: "A new Flutter project."
+publish_to: 'none'
+version: 1.0.2+3
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+################################################################################
+# 📦  Runtime dependencies
+################################################################################
+dependencies:
+  flutter:
+    sdk: flutter
+
+  ## ── UI ──────────────────────────────────────────────────────────────────────
+  cupertino_icons: ^1.0.8
+  fl_chart: ^0.62.0
+  intl: ^0.20.2
+  flutter_localizations:
+    sdk: flutter
+  skeletonizer: ^0.5.0
+  shimmer: ^2.0.0
+  cached_network_image: ^3.2.3
+  flutter_native_splash: ^2.4.2
+
+  ## ── State / DI ──────────────────────────────────────────────────────────────
+  get: ^4.6.5
+  get_storage: ^2.1.1
+  rxdart: ^0.27.7
+  get_it: ^7.6.0
+
+   # ── State / Routing ───────────────────────────────────────────────────
+  flutter_riverpod: ^2.6.1      #  ← new
+  hooks_riverpod: ^2.4.0        #  ← new (use-hooks optional)
+  go_router: ^15.1.2            #  ← new
+
+
+  ## ── Networking ─────────────────────────────────────────────────────────────
+  dio: ^5.3.2
+  http: ^0.13.6                 # dio 외부 패키지(예: dart_openai)가 의존
+  web_socket_channel: ^3.0.1
+  retry: ^3.1.2
+
+
+  ## ── AI / OpenAI ────────────────────────────────────────────────────────────
+  dart_openai: ^3.0.0
+  http_parser: ^4.0.2
+
+  ## ── Security ───────────────────────────────────────────────────────────────
+  flutter_secure_storage: ^8.0.0
+  encrypt: ^5.0.1
+  crypto: ^3.0.3
+  url_launcher: ^6.2.4
+
+  ## ── Utils ──────────────────────────────────────────────────────────────────
+  flutter_dotenv: ^5.0.2        #  ← .env 로딩 (AppConfig 예시 반영)
+  wakelock_plus: ^1.1.1
+  path_provider: ^2.1.1
+  uuid: ^4.5.1
+  connectivity_plus: ^4.0.2
+  logger: ^1.4.0
+  dartz: ^0.10.1
+  json_annotation: ^4.9.0
+  equatable: ^2.0.5
+  intl_utils: ^2.8.3
+  collection: ^1.18.0
+  async: ^2.11.0
+  stream_transform: ^2.1.0
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+  package_info_plus: ^4.1.0
+  device_info_plus: ^9.0.3
+  synchronized: ^3.0.0
+  meta: ^1.9.0
+  geolocator: ^12.0.0
+  shared_preferences: ^2.5.3
+  flutter_launcher_icons: ^0.14.3
+  video_player: ^2.8.1
+  lru: ^1.0.2
+  fast_immutable_collections: ^10.2.4
+  
+
+################################################################################
+# 🧪  Dev dependencies
+################################################################################
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.2
+
+  # Code-gen & tooling
+  build_runner: ^2.4.6
+  json_serializable: ^6.7.1
+  hive_generator: ^2.0.0
+
+  # CI / CD & assets
+
+  # Testing / mocks
+  mocktail: ^1.0.0              #  ← mockito 제거, mocktail 단일 사용
+  test: ^1.24.3
+  bloc_test: ^9.1.3             # Bloc 도입 시 사용 (남겨둠)
+  patrol: ^0.6.5
+  integration_test:
+    sdk: flutter
+  fake_async: ^1.3.1
+  connectivity_plus_platform_interface: ^1.2.4
+
+################################################################################
+# 🎯  Flutter settings
+################################################################################
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/icon.png
+    - assets/common_app_bar_icon.webp
+    - assets/app_information_icon.webp
+    - assets/images/
+    - assets/animations/
+    - assets/sounds/
+    - assets/noonchit_intro_84frames.mp4
+    - assets/icons/money/
+    - assets/icons/sector/
+
+  fonts:
+    # ==================== 기본 폰트 (프리텐다드) ====================
+    - family: Pretendard
+      fonts:
+        - asset: assets/fonts/Pretendard-Regular.otf
+          weight: 400
+        - asset: assets/fonts/Pretendard-Medium.otf
+          weight: 500
+        - asset: assets/fonts/Pretendard-Bold.otf
+          weight: 700
+
+    # ==================== 선택된 추가 폰트들 (최종) ====================
+ 
+    # 🇯🇵 도트고딕16 (일본어 픽셀)
+    - family: DotGothic16-Regular
+      fonts:
+        - asset: assets/fonts/DotGothic16-Regular.ttf
+        
+    # 🎈 다이나퍼프 (귀여운)
+    - family: DynaPuff-VariableFont_wdth,wght
+      fonts:
+        - asset: assets/fonts/DynaPuff-VariableFont_wdth,wght.ttf
+
+    # ✍️ 글로리아 할렐루야 (손글씨)
+    - family: GloriaHallelujah-Regular
+      fonts:
+        - asset: assets/fonts/GloriaHallelujah-Regular.ttf
+
+    # 🇰🇷 고운돋움 (한글)
+    - family: GowunDodum-Regular
+      fonts:
+        - asset: assets/fonts/GowunDodum-Regular.ttf
+
+    # 🇰🇷 구기 (한글)
+    - family: Gugi-Regular
+      fonts:
+        - asset: assets/fonts/Gugi-Regular.ttf
+
+    # 🇰🇷 IBM 플렉스 산스 (한글)
+    - family: IBMPlexSansKR-Light
+      fonts:
+        - asset: assets/fonts/IBMPlexSansKR-Light.ttf
+    
+    # 💻 인콘솔라타 (모노스페이스)
+    - family: Inconsolata-VariableFont_wdth,wght
+      fonts:
+        - asset: assets/fonts/Inconsolata-VariableFont_wdth,wght.ttf
+
+    # 🇰🇷 키랑해랑 (한글)
+    - family: KirangHaerang-Regular
+      fonts:
+        - asset: assets/fonts/KirangHaerang-Regular.ttf
+    
+    # 🇰🇷 나눔고딕코딩 (한글)
+    - family: NanumGothicCoding-Regular
+      fonts:
+        - asset: assets/fonts/NanumGothicCoding-Regular.ttf
+
+    # 🇰🇷 노토세리프 (한글)
+    - family: NotoSerifKR-VariableFont_wght
+      fonts:
+        - asset: assets/fonts/NotoSerifKR-VariableFont_wght.ttf
+        
+    # 💻 노바 모노 (모노스페이스)
+    - family: NovaMono-Regular
+      fonts:
+        - asset: assets/fonts/NovaMono-Regular.ttf
+
+    # 🔲 노바 스퀘어
+    - family: NovaSquare-Regular
+      fonts:
+        - asset: assets/fonts/NovaSquare-Regular.ttf
+        
+    # ✒️ 퍼머넌트 마커 (마커펜)
+    - family: PermanentMarker-Regular
+      fonts:
+        - asset: assets/fonts/PermanentMarker-Regular.ttf
+
+    # 🎮 픽셀리파이산스 (픽셀)
+    - family: PixelifySans-VariableFont_wght
+      fonts:
+        - asset: assets/fonts/PixelifySans-VariableFont_wght.ttf
+
+    # 🌻 썬플라워 (한글) - Light
+    - family: Sunflower-Light
+      fonts:
+        - asset: assets/fonts/Sunflower-Light.ttf
+
+    # 🎭 사인모노 (모노스페이스)
+    - family: SyneMono-Regular
+      fonts:
+        - asset: assets/fonts/SyneMono-Regular.ttf
+
+  generate: true
+
+
+################################################################################
+# 🔧  Tool configs
+################################################################################
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/icon.png
+  remove_alpha_ios: true
+  min_sdk_android: 21
+
+flutter_native_splash:
+  color: "#FFFFFF"
+  image: assets/splash.png
+  android: true
+  ios: true
+  fullscreen: false
+
+  # ✅ Android: 비율 유지 + 중앙 정렬
+  android_gravity: center
+
+  # ✅ iOS: 비율 유지 + 중앙 정렬
+  ios_content_mode: center
+
+
+flutter_intl:
+  enabled: true
+  main_locale: en
+  arb_dir: l10n
+  output_dir: .dart_tool/flutter_intl
