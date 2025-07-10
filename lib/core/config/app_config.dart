@@ -1,70 +1,69 @@
-// lib/core/config/app_config.dart
-
 import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:logger/logger.dart';
 import '../utils/logger.dart';
 
-/// 🔄 Binance Futures 전용으로 재구성된 애플리케이션 설정
+/// 바이낸스 선물(USDⓈ-M) 전용 애플리케이션 설정 (풀-세팅 버전)
 class AppConfig {
-  AppConfig._();
+  AppConfig._(); // 인스턴스화 방지
 
-  static Future<void> init({String? envPath}) async {
+  // ===================================================================
+  // 1. 환경 변수 및 토글
+  // ===================================================================
+
+  /// ✅ 테스트넷 사용 여부. `dart --define=BINANCE_TESTNET=true`로 컴파일 시 true.
+  static const bool useTestnet = bool.fromEnvironment('BINANCE_TESTNET');
+
+  static String apiKey = '';
+  static String apiSecret = '';
+
+  static Future<void> initialize() async {
     try {
-      await dotenv.load(fileName: envPath ?? '.env');
-      _loadEnv();
+      await dotenv.load();
+      apiKey = dotenv.env['BINANCE_API_KEY'] ?? '';
+      apiSecret = dotenv.env['BINANCE_API_SECRET'] ?? '';
+      log.i('[AppConfig] Initialized. Testnet mode: $useTestnet');
     } catch (e) {
-      log.w('[AppConfig] .env file not found, using defaults.');
+      log.w('[AppConfig] .env not found. Using empty credentials.');
     }
-    log.i('[AppConfig] Initialized for Binance Futures.');
   }
 
-  static void _loadEnv() {
-    // 🔄 바이낸스 API 키 로드
-    _apiKey = dotenv.env['BINANCE_API_KEY'] ?? '';
-    _apiSecret = dotenv.env['BINANCE_API_SECRET'] ?? '';
-  }
+  // ===================================================================
+  // 2. 네트워크 엔드포인트 (테스트넷/메인넷 자동 전환)
+  // ===================================================================
 
-  // ─────────────────── API Credentials ───────────────────
-  static String _apiKey = '';
-  static String _apiSecret = '';
-  static String get apiKey => _apiKey;
-  static String get apiSecret => _apiSecret;
+  // ✅ 환경에 따라 URL을 동적으로 반환
+  static String get restBaseUrl =>
+      useTestnet ? _testnetRestUrl : _mainnetRestUrl;
+  
+  static String get streamUrl =>
+      useTestnet ? _testnetStreamUrl : _mainnetStreamUrl;
+      
+  // Private 상수
+  static const String _mainnetRestUrl = 'https://fapi.binance.com';
+  static const String _testnetRestUrl = 'https://testnet.binancefuture.com';
+  static const String _mainnetStreamUrl = 'wss://fstream.binance.com/stream';
+  static const String _testnetStreamUrl = 'wss://stream.binancefuture.com/stream';
 
-  // ──────────────── Environment & Logging ────────────────
-  static const bool isDebugMode = !bool.fromEnvironment('dart.vm.product');
-  static Level get logLevel => isDebugMode ? Level.debug : Level.warning;
-  static bool get enableWebSocketLog => true;
-  static bool get enableTradeLog => true;
 
-  // ──────────────── 🔄 Binance Futures REST API ────────────────
-  static const String restBaseUrl = 'https://fapi.binance.com';
-  // 💡 바이낸스는 IP당 분당 2400의 가중치를 가짐. 대부분의 조회는 가중치 1~5 소모.
-  //    자세한 Rate-Limit 로직은 ApiClient의 인터셉터에서 관리.
-  static const Duration restTimeout = Duration(seconds: 10);
+  // ===================================================================
+  // 3. WebSocket 규칙 및 제한 (체크리스트 기반)
+  // ===================================================================
 
-  // ──────────────── 🔄 Binance Futures WebSocket API ────────────────
-  static const String streamUrl = 'wss://fstream.binance.com/stream';
-  static const int wsMaxSubscriptions = 1024;
-  // 💡 바이낸스는 서버가 3분마다 Ping을 보내므로 클라이언트 Ping은 불필요.
-  //    10분 내 Pong 응답이 없으면 연결 종료.
-  static const Duration wsPongTimeout = Duration(minutes: 10);
-  static const int wsMaxRetries = 10;
-  static const Duration wsInitialBackoff = Duration(seconds: 2);
-  static const Duration wsMaxBackoff = Duration(seconds: 30);
+  /// ✅ 서버 Ping에 대한 Pong 응답 타임아웃 (공식: 1분, 안전 버퍼 포함)
+  static const Duration wsPongTimeout = Duration(seconds: 70);
+  
+  /// ✅ 클라이언트가 먼저 보내는 Unsolicited Pong 주기 (서버 생존 확인용)
+  static const Duration wsUnsolicitedPongInterval = Duration(seconds: 30);
 
-  // ──────────────── 🔄 Trade Filters (단위: USDT) ────────────────
-  //    거래 필터 단위를 원화(KRW)에서 USDT로 변경
-  static final List<double> tradeFilters = [
-    10000,   // 1만 USDT
-    20000,   // 2만 USDT
-    50000,   // 5만 USDT
-    100000,  // 10만 USDT
-    200000,  // 20만 USDT
-    500000,  // 50만 USDT
-  ];
+  /// ✅ 24시간 세션 만료에 대비한 자동 재연결 주기
+  static const Duration wsSessionRefresh = Duration(hours: 23, minutes: 55);
 
-  static String formatFilterLabel(double f) {
-    if (f >= 10000) return '${(f / 10000).toInt()}만\$';
-    return '${(f / 1000).toInt()}천\$';
-  }
+  /// ✅ 단일 연결 최대 스트림 구독 개수
+  static const int wsMaxStreams = 1024;
+  
+  /// ✅ 초당 최대 수신 메시지 개수 (데이터, Ping, Pong 등 모두 포함)
+  static const int wsMaxInMsgPerSec = 10;
+  
+  /// ✅ 제어 메시지(SUB/UNSUB 등) 전송 간 최소 간격 (초당 5회 제한)
+  static const Duration wsControlMsgInterval = Duration(milliseconds: 200);
+
 }

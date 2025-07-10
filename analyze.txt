@@ -1,0 +1,24 @@
+Analyzing binance_noonchit_test...                              
+
+   info • Unnecessary constructor invocation • lib/core/di/core_provider.dart:82:20 • prefer_collection_literals
+  error • The named parameter 'error' isn't defined • lib/core/network/api_client.dart:25:48 • undefined_named_parameter
+  error • The named parameter 'error' isn't defined • lib/core/network/api_client.dart:29:54 • undefined_named_parameter
+  error • The named parameter 'error' isn't defined • lib/core/network/websocket/base_ws_client.dart:96:44 • undefined_named_parameter
+  error • The named parameter 'stackTrace' isn't defined • lib/core/network/websocket/base_ws_client.dart:96:54 • undefined_named_parameter
+  error • The named parameter 'error' isn't defined • lib/core/network/websocket/base_ws_client.dart:146:51 • undefined_named_parameter
+  error • The named parameter 'stackTrace' isn't defined • lib/core/network/websocket/base_ws_client.dart:146:61 • undefined_named_parameter
+  error • The named parameter 'error' isn't defined • lib/core/network/websocket/trade_ws_client.dart:38:58 • undefined_named_parameter
+  error • Target of URI doesn't exist: 'trade_remote_ds.dart' • lib/data/repositories/trade_repository_impl.dart:5:8 • uri_does_not_exist
+  error • Undefined class 'TradeRemoteDataSource' • lib/data/repositories/trade_repository_impl.dart:13:9 • undefined_class
+  error • The getter 'timestampMs' isn't defined for the type 'Trade' • lib/presentation/binance_live_page.dart:61:67 • undefined_getter
+  error • The getter 'volume' isn't defined for the type 'Trade' • lib/presentation/binance_live_page.dart:83:52 • undefined_getter
+  error • The getter 'volume' isn't defined for the type 'Trade' • lib/presentation/binance_live_page.dart:92:68 • undefined_getter
+  error • The getter 'subscription' isn't defined for the type 'ProviderSubscription<List<Trade>>' • lib/presentation/controllers/trade_controller.dart:90:7 • undefined_getter
+  error • The name 'tradeControllerProvider' is defined in the libraries 'package:binance_noonchit_test/presentation/controllers/trade_controller.dart' and 'package:binance_noonchit_test/presentation/widgets/trade_tile.dart' • lib/presentation/pages/trade_page.dart:15:29 • ambiguous_import
+  error • The name 'tradeControllerProvider' is defined in the libraries 'package:binance_noonchit_test/presentation/controllers/trade_controller.dart' and 'package:binance_noonchit_test/presentation/widgets/trade_tile.dart' • lib/presentation/pages/trade_page.dart:17:33 • ambiguous_import
+  error • The name 'TradeController' is defined in the libraries 'package:binance_noonchit_test/presentation/controllers/trade_controller.dart' and 'package:binance_noonchit_test/presentation/widgets/trade_tile.dart' • lib/presentation/pages/trade_page.dart:43:5 • ambiguous_import
+  error • The name 'TradeControllerState' is defined in the libraries 'package:binance_noonchit_test/presentation/controllers/trade_controller.dart' and 'package:binance_noonchit_test/presentation/widgets/trade_tile.dart' • lib/presentation/pages/trade_page.dart:44:5 • ambiguous_import
+  error • The name 'TradeControllerState' is defined in the libraries 'package:binance_noonchit_test/presentation/controllers/trade_controller.dart' and 'package:binance_noonchit_test/presentation/widgets/trade_tile.dart' • lib/presentation/pages/trade_page.dart:77:26 • ambiguous_import
+  error • The method 'TradeTile' isn't defined for the type 'TradePage' • lib/presentation/pages/trade_page.dart:104:16 • undefined_method
+  error • The getter 'subscription' isn't defined for the type 'ProviderSubscription<List<Trade>>' • lib/presentation/widgets/trade_tile.dart:90:7 • undefined_getter
+

@@ -1,0 +1,774 @@
+\n\n// ====== lib/core/di/trade_provider.dart ======\n
+\n\n// ====== lib/core/di/binance_provider.dart ======\n
+// lib/core/di/binance_provider.dart
+
+import 'dart:async';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../domain/entities/trade.dart';
+import '../network/binance_ws_client.dart';
+
+// 1. 웹소켓 클라이언트 프로바이더
+final binanceClientProvider = Provider((ref) {
+  final client = BinanceWsClient();
+  ref.onDispose(() => client.dispose());
+  return client;
+});
+
+// 2. UI에 직접 데이터를 제공할 최종 프로바이더
+final binanceTradesProvider =
+    StateNotifierProvider<BinanceTradesNotifier, List<Trade>>((ref) {
+  return BinanceTradesNotifier(ref);
+});
+
+class BinanceTradesNotifier extends StateNotifier<List<Trade>> {
+  final Ref _ref;
+  StreamSubscription? _subscription;
+
+  BinanceTradesNotifier(this._ref) : super([]) {
+    _connect();
+  }
+
+  void _connect() {
+    final client = _ref.read(binanceClientProvider);
+    
+    // 하드코딩된 구독 종목
+    client.connect(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT']);
+
+    _subscription?.cancel();
+    _subscription = client.stream.listen((trade) {
+      // 최신 100개의 체결 데이터만 상태로 관리
+      state = [trade, ...state].take(100).toList();
+    });
+  }
+
+  @override
+  void dispose() {
+    _subscription?.cancel();
+    super.dispose();
+  }
+}\n\n// ====== lib/core/di/websocket_provider.dart ======\n
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../network/websocket/base_ws_client.dart';
+import '../network/websocket/trade_ws_client.dart';
+import '../utils/logger.dart';
+
+/// WebSocket 연결 상태를 UI에 제공하는 Provider
+final wsStatusProvider = StateProvider<WsStatus>((ref) => WsStatus.disconnected);
+
+/// WebSocket 클라이언트 인스턴스를 생성하고 제공하는 핵심 Provider
+///
+/// 이 Provider는 `TradeWsClient` (내부적으로 바이낸스 로직을 가짐)를 생성하고,
+/// 클라이언트의 상태 변경을 감지하여 `wsStatusProvider`를 업데이트합니다.
+final wsClientProvider = Provider<TradeWsClient>((ref) {
+  return TradeWsClient(
+    onStatusChange: (status) {
+      // WebSocket 클라이언트의 내부 상태가 변경될 때마다
+      // UI가 감지할 수 있도록 `wsStatusProvider`의 상태를 업데이트합니다.
+      final currentStatus = ref.read(wsStatusProvider);
+      if (currentStatus != status) {
+        ref.read(wsStatusProvider.notifier).state = status;
+        log.i('[WebSocket] Status changed to: $status');
+      }
+    },
+  );
+});\n\n// ====== lib/core/di/volume_provider.dart ======\n
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../data/repositories/volume_repository_impl.dart';
+import '../../domain/entities/volume.dart'; // ✅ 누락된 import 추가
+import '../../domain/repositories/volume_repository.dart';
+import '../../domain/usecases/volume_usecase.dart';
+import 'core_provider.dart';
+
+// ===================================================================
+// 1. Data & Domain Layer Providers
+// ===================================================================
+
+final volumeRepositoryProvider = Provider<VolumeRepository>((ref) {
+  final remoteDS = ref.watch(tradeRemoteDSProvider); 
+  final repo = VolumeRepositoryImpl(remoteDS);
+  ref.onDispose(() => repo.dispose());
+  return repo;
+});
+
+final volumeUsecaseProvider = Provider((ref) {
+  final usecase = VolumeUsecase(ref.watch(volumeRepositoryProvider));
+  return usecase;
+});
+
+
+// ===================================================================
+// 2. UI State & Final Data Provider
+// ===================================================================
+
+final volumeTimeFrameProvider = StateProvider<TimeFrame>((ref) => TimeFrame.min5);
+
+final volumeDataProvider = StreamProvider.autoDispose<List<Volume>>((ref) {
+  final timeFrame = ref.watch(volumeTimeFrameProvider);
+  final marketsAsync = ref.watch(marketsProvider);
+  final usecase = ref.read(volumeUsecaseProvider);
+
+  return marketsAsync.when(
+    data: (markets) {
+      if (markets.isEmpty) return const Stream.empty();
+      return usecase.watchVolumeRanking(timeFrame, markets);
+    },
+    loading: () => const Stream.empty(),
+    error: (e, st) => Stream.error(e, st),
+  );
+});\n\n// ====== lib/core/di/core_provider.dart ======\n
+import 'dart:async';
+import 'dart:collection';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../data/datasources/trade_remote_ds.dart';
+import '../../data/repositories/trade_repository_impl.dart';
+import '../../domain/entities/trade.dart';
+import '../../domain/repositories/trade_repository.dart';
+import '../common/time_frame_types.dart';
+import '../config/app_config.dart';
+import '../network/api_client.dart';
+import '../utils/logger.dart';
+import 'websocket_provider.dart';
+
+// ===================================================================
+// 1. Service & Data Layer Providers
+// ===================================================================
+
+final apiClientProvider = Provider((_) => ApiClient());
+final tradeRemoteDSProvider = Provider((ref) => TradeRemoteDataSource(ref.watch(wsClientProvider)));
+final tradeRepositoryProvider = Provider<TradeRepository>((ref) {
+  final repo = TradeRepositoryImpl(ref.watch(tradeRemoteDSProvider));
+  // ✅ Provider가 소멸될 때 Repository의 dispose 메서드 호출
+  ref.onDispose(() => repo.dispose());
+  return repo;
+});
+
+
+// ===================================================================
+// 2. Market Info & Raw Data Stream Providers
+// ===================================================================
+
+final marketsProvider = FutureProvider.autoDispose<List<String>>((ref) async {
+  log.d('Fetching top volume markets from Binance...');
+  final client = ref.watch(apiClientProvider);
+  try {
+    final List<dynamic> tickers = await client.get('/fapi/v1/ticker/24hr');
+    
+    tickers.removeWhere((t) => !(t['symbol'] as String).endsWith('USDT'));
+    tickers.sort((a, b) {
+      final volumeA = double.tryParse(a['quoteVolume'].toString()) ?? 0;
+      final volumeB = double.tryParse(b['quoteVolume'].toString()) ?? 0;
+      return volumeB.compareTo(volumeA);
+    });
+
+    final markets = tickers.map((t) => t['symbol'] as String).take(AppConfig.wsMaxSubscriptions).toList();
+    log.i('Fetched ${markets.length} markets, sorted by volume.');
+    return markets;
+  } catch (e, st) {
+    log.e('Failed to fetch Binance markets', e, st);
+    return ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+  }
+});
+
+final rawTradeStreamProvider = StreamProvider.autoDispose<Trade>((ref) {
+  final repo = ref.watch(tradeRepositoryProvider);
+  final marketsAsyncValue = ref.watch(marketsProvider);
+
+  return marketsAsyncValue.when(
+    // ✅ 수정된 부분: Repository 인터페이스에 정의된 `watchAggregatedTrades`를 사용
+    data: (markets) => markets.isEmpty ? const Stream.empty() : repo.watchAggregatedTrades(markets),
+    loading: () => const Stream.empty(),
+    error: (e, st) => Stream.error(e, st),
+  );
+});
+
+
+// ===================================================================
+// 3. Filtered Data & UI State Providers
+// ===================================================================
+
+final tradeFilterProvider = StateProvider<TradeFilter>((ref) => TradeFilter.usdt50k);
+
+final filteredTradesProvider = Provider.autoDispose<List<Trade>>((ref) {
+  final cache = ref.watch(_tradeCacheProvider);
+  final filter = ref.watch(tradeFilterProvider);
+  return cache[filter] ?? [];
+});
+
+final _tradeCacheProvider = StateNotifierProvider.autoDispose<TradeCacheNotifier, Map<TradeFilter, List<Trade>>>((ref) {
+  return TradeCacheNotifier(ref);
+});
+
+class TradeCacheNotifier extends StateNotifier<Map<TradeFilter, List<Trade>>> {
+  final Ref _ref;
+  final _seenIds = LinkedHashSet<String>();
+  ProviderSubscription? _sub;
+
+  TradeCacheNotifier(this._ref)
+      : super({ for (var filter in TradeFilter.values) filter: [] }) {
+    _sub = _ref.listen<AsyncValue<Trade>>(
+      rawTradeStreamProvider,
+      (previous, next) {
+        next.whenData(_processTrade);
+      },
+      fireImmediately: true,
+    );
+  }
+  
+  void _processTrade(Trade trade) {
+    if (!_seenIds.add(trade.tradeId)) return;
+    if (_seenIds.length > TradeConfig.maxSeenIdsCacheSize) {
+      _seenIds.remove(_seenIds.first);
+    }
+    
+    final currentCache = Map.of(state);
+    bool needsUpdate = false;
+
+    for (final filter in TradeFilter.values) {
+      if (trade.totalValue >= filter.value) {
+        final list = currentCache[filter]!;
+        list.insert(0, trade);
+        if (list.length > TradeConfig.maxTradesPerFilter) {
+          currentCache[filter] = list.sublist(0, TradeConfig.maxTradesPerFilter);
+        }
+        needsUpdate = true;
+      }
+    }
+    
+    if (needsUpdate) {
+      state = currentCache;
+    }
+  }
+  
+  @override
+  void dispose() {
+    _sub?.close();
+    super.dispose();
+  }
+}\n\n// ====== lib/core/config/binance_config.dart ======\n
+// lib/core/config/binance_config.dart
+
+class BinanceConfig {
+  /// 바이낸스 선물 통합 스트림 URL
+  static const String streamUrl = 'wss://fstream.binance.com/stream';
+}\n\n// ====== lib/core/config/app_config.dart ======\n
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import '../utils/logger.dart';
+
+/// 바이낸스 선물(USDⓈ-M) 전용 애플리케이션 설정
+class AppConfig {
+  AppConfig._(); // 인스턴스화 방지
+
+  // ------------------- API Credentials -------------------
+  // 보안을 위해 .env 파일에서 로드합니다.
+  static String apiKey = '';
+  static String apiSecret = '';
+
+  /// 앱 시작 시 .env 파일에서 환경 변수를 로드하는 초기화 메서드
+  static Future<void> initialize() async {
+    try {
+      await dotenv.load();
+      apiKey = dotenv.env['BINANCE_API_KEY'] ?? '';
+      apiSecret = dotenv.env['BINANCE_API_SECRET'] ?? '';
+      log.i('[AppConfig] Environment variables loaded successfully.');
+    } catch (e) {
+      log.w('[AppConfig] .env file not found or failed to load. Using default empty credentials.');
+    }
+  }
+
+  // ------------------- REST API Configuration -------------------
+  /// 바이낸스 선물 REST API 기본 URL
+  static const String restBaseUrl = 'https://fapi.binance.com';
+
+  /// API 요청 타임아웃 (연결 및 수신)
+  static const Duration restTimeout = Duration(seconds: 10);
+
+  // ------------------- WebSocket API Configuration -------------------
+  /// 바이낸스 선물 통합 스트림 URL
+  static const String streamUrl = 'wss://fstream.binance.com/stream';
+  
+  /// WebSocket 재연결 시도 간격
+  static const Duration wsReconnectDelay = Duration(seconds: 5);
+  
+  /// 서버로부터 메시지가 없을 때 타임아웃으로 간주할 시간
+  /// 바이낸스는 3분마다 서버 Ping을 보내므로, 5분으로 설정하면 안정적입니다.
+  static const Duration wsPongTimeout = Duration(minutes: 5);
+  
+  /// WebSocket이 구독할 수 있는 최대 마켓 수
+  static const int wsMaxSubscriptions = 200; // 바이낸스는 더 높지만, 성능을 위해 200개로 제한
+
+  // ------------------- Trade Filter Configuration -------------------
+  /// 거래대금 필터 기준 목록 (단위: USDT)
+  static const List<double> tradeFilters = [
+    10000,   // 1만 USDT
+    30000,   // 3만 USDT
+    50000,   // 5만 USDT
+    100000,  // 10만 USDT
+    300000,  // 30만 USDT
+    500000,  // 50만 USDT
+  ];
+
+  /// 필터 값을 UI에 표시할 형식으로 변환하는 헬퍼 메서드
+  static String formatFilterValue(double value) {
+    if (value >= 1000) {
+      return '${(value / 1000).round()}K USDT';
+    }
+    return '${value.round()} USDT';
+  }
+}\n\n// ====== lib/core/network/binance_auth_interceptor.dart ======\n
+// lib/core/network/binance_auth_interceptor.dart
+
+import 'dart:convert';
+import 'package:crypto/crypto.dart';
+import 'package:dio/dio.dart';
+import '../config/app_config.dart';
+
+/// 바이낸스 API 요청에 HMAC-SHA256 시그니처를 추가하는 인터셉터
+class BinanceAuthInterceptor extends Interceptor {
+  @override
+  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    // API 키/시크릿이 필요한 private 엔드포인트에만 적용
+    if (AppConfig.apiKey.isEmpty || AppConfig.apiSecret.isEmpty) {
+      return handler.next(options);
+    }
+    
+    // Public API는 시그니처 불필요
+    if (!options.path.contains('/v1/order') && !options.path.contains('/v1/account')) {
+        options.headers['X-MBX-APIKEY'] = AppConfig.apiKey;
+        return handler.next(options);
+    }
+
+    // 타임스탬프 추가
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    options.queryParameters['timestamp'] = timestamp;
+
+    // 쿼리 파라미터를 문자열로 변환
+    final query = Uri(queryParameters: options.queryParameters).query;
+
+    // HMAC-SHA256 시그니처 생성
+    final key = utf8.encode(AppConfig.apiSecret);
+    final bytes = utf8.encode(query);
+    final hmac = Hmac(sha256, key);
+    final digest = hmac.convert(bytes);
+    
+    // 시그니처를 쿼리에 추가
+    options.queryParameters['signature'] = digest.toString();
+    options.headers['X-MBX-APIKEY'] = AppConfig.apiKey;
+
+    return handler.next(options);
+  }
+}\n\n// ====== lib/core/network/websocket/trade_ws_client.dart ======\n
+import 'dart:convert';
+import '../../config/app_config.dart';
+import '../../../domain/entities/trade.dart';
+import '../../utils/logger.dart';
+import 'base_ws_client.dart';
+
+/// 바이낸스 선물(aggTrade) 스트림 전용 클라이언트
+class TradeWsClient extends BaseWsClient<Trade> {
+  TradeWsClient({void Function(WsStatus status)? onStatusChange})
+      : super(
+          // 1. URL: AppConfig에서 바이낸스 스트림 URL을 가져옴
+          url: AppConfig.streamUrl,
+          onStatusChange: onStatusChange,
+
+          // 2. Ping/Pong: 바이낸스 정책에 맞게 설정
+          clientPingInterval: null, // 서버가 Ping을 보내므로 클라이언트 Ping은 비활성화
+          pongTimeout: AppConfig.wsPongTimeout,
+
+          // 3. 구독 메시지 생성 (Binance 양식)
+          encodeSubscribe: (markets) {
+            final params = markets.map((m) => '${m.toLowerCase()}@aggTrade').toList();
+            return json.encode({
+              'method': 'SUBSCRIBE',
+              'params': params,
+              'id': DateTime.now().millisecondsSinceEpoch
+            });
+          },
+
+          // 4. 데이터 파싱 (Binance 양식)
+          decode: (json) {
+            if (json is! Map<String, dynamic>) return null;
+
+            // 실제 체결 데이터가 'data' 필드에 있는지 확인
+            if (json.containsKey('data')) {
+              try {
+                return Trade.fromBinance(json['data']);
+              } catch (e, st) {
+                // ✅ 에러 로깅 방식 수정
+                log.e('[WS Decode] Trade parsing error', e, st);
+                return null;
+              }
+            }
+            
+            // 구독 성공 응답 등 데이터가 아닌 메시지는 무시
+            return null;
+          },
+        );
+}\n\n// ====== lib/core/network/websocket/base_ws_client.dart ======\n
+import 'dart:async';
+import 'dart:convert';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import '../../utils/logger.dart';
+
+/// WebSocket 연결 상태를 나타내는 Enum
+enum WsStatus {
+  connecting,
+  connected,
+  reconnecting,
+  disconnected,
+}
+
+/// JSON 디코딩과 구독 메시지 인코딩을 위한 함수 타입 정의
+typedef DecodeFn<T> = T? Function(dynamic json);
+typedef EncodeFn = String Function(List<String> symbols);
+
+/// 범용 WebSocket 클라이언트 (재사용 가능한 고품질 버전)
+class BaseWsClient<T> {
+  final String url;
+  final DecodeFn<T> decode;
+  final EncodeFn encodeSubscribe;
+  final void Function(WsStatus status)? onStatusChange;
+  
+  final Duration? clientPingInterval;
+  final Duration pongTimeout;
+
+  WebSocketChannel? _channel;
+  final StreamController<T> _dataController = StreamController<T>.broadcast();
+  List<String> _subscribedSymbols = [];
+  Timer? _pingTimer;
+  Timer? _pongTimer;
+  Timer? _reconnectTimer;
+  bool _isDisposed = false;
+  WsStatus _currentStatus = WsStatus.disconnected;
+
+  BaseWsClient({
+    required this.url,
+    required this.decode,
+    required this.encodeSubscribe,
+    this.onStatusChange,
+    this.clientPingInterval,
+    required this.pongTimeout,
+  });
+
+  Stream<T> get stream => _dataController.stream;
+
+  void connect(List<String> symbols) {
+    if (_isDisposed || symbols.isEmpty || _currentStatus == WsStatus.connecting) return;
+    _subscribedSymbols = symbols;
+    _reconnectTimer?.cancel();
+    _updateStatus(WsStatus.connecting);
+    _channel?.sink.close();
+
+    try {
+      _channel = WebSocketChannel.connect(Uri.parse(url));
+      _channel!.sink.add(encodeSubscribe(_subscribedSymbols));
+      _channel!.stream.listen(
+        _handleMessage,
+        onDone: () => _scheduleReconnect(reason: 'Stream done'),
+        onError: (error) => _scheduleReconnect(reason: 'Stream error: $error'),
+        cancelOnError: true,
+      );
+      _updateStatus(WsStatus.connected);
+      _resetPongTimer();
+      _setupClientPing();
+    } catch (e) {
+      _scheduleReconnect(reason: 'Connection failed: $e');
+    }
+  }
+
+  void _handleMessage(dynamic message) {
+    _resetPongTimer();
+    try {
+      final decodedData = decode(jsonDecode(message));
+      if (decodedData != null) {
+        _dataController.add(decodedData);
+      }
+    } catch (e, st) {
+      // ✅ 에러 로깅 방식 수정
+      log.e('[WS] Message decoding error', e, st);
+    }
+  }
+
+  void _setupClientPing() {
+    _pingTimer?.cancel();
+    if (clientPingInterval != null) {
+      _pingTimer = Timer.periodic(clientPingInterval!, (_) {
+        if (_isDisposed) {
+          _pingTimer?.cancel();
+          return;
+        }
+        _channel?.sink.add('PING');
+        log.d('[WS] Client PING sent.');
+      });
+    }
+  }
+
+  void _resetPongTimer() {
+    _pongTimer?.cancel();
+    _pongTimer = Timer(pongTimeout, () {
+      log.w('[WS] Pong timeout. No message received for ${pongTimeout.inSeconds}s.');
+      _scheduleReconnect(reason: 'Pong timeout');
+    });
+  }
+
+  void _scheduleReconnect({required String reason}) {
+    if (_isDisposed || (_reconnectTimer?.isActive ?? false)) return;
+    _updateStatus(WsStatus.reconnecting);
+    log.w('[WS] Disconnected. Reason: $reason. Reconnecting in 5 seconds...');
+    _pingTimer?.cancel();
+    _pongTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 5), () {
+      connect(_subscribedSymbols);
+    });
+  }
+
+  void _updateStatus(WsStatus status) {
+    if (_currentStatus == status) return;
+    _currentStatus = status;
+    try {
+      onStatusChange?.call(status);
+    } catch (e, st) {
+      // ✅ 에러 로깅 방식 수정
+      log.e('[WS] onStatusChange callback error', e, st);
+    }
+  }
+
+  void dispose() {
+    if (_isDisposed) return;
+    _isDisposed = true;
+    log.i('[WS] Disposing client for $url');
+    _pingTimer?.cancel();
+    _pongTimer?.cancel();
+    _reconnectTimer?.cancel();
+    _channel?.sink.close();
+    _dataController.close();
+    _updateStatus(WsStatus.disconnected);
+  }
+}\n\n// ====== lib/core/network/base_ws_client.dart ======\n
+\n\n// ====== lib/core/network/api_client.dart ======\n
+import 'package:dio/dio.dart';
+import '../config/app_config.dart';
+import '../error/app_exception.dart';
+import '../utils/logger.dart';
+
+/// 바이낸스 선물 REST API 통신을 위한 클라이언트
+class ApiClient {
+  final Dio _dio;
+
+  ApiClient({Dio? dio})
+      : _dio = dio ??
+            Dio(BaseOptions(
+              baseUrl: AppConfig.restBaseUrl,
+              connectTimeout: AppConfig.restTimeout,
+              receiveTimeout: AppConfig.restTimeout,
+            ));
+
+  /// GET 요청을 위한 범용 메서드
+  Future<dynamic> get(String path) async {
+    try {
+      log.d('[API] GET: $path');
+      final response = await _dio.get(path);
+      return response.data;
+    } on DioException catch (e, st) {
+      // ✅ 에러 로깅 방식을 positional argument로 수정
+      log.e('[API] GET failed on path: $path', e, st);
+      // DioException을 커스텀 NetworkException으로 변환하여 반환
+      throw NetworkException.fromDio(e);
+    } catch (e, st) {
+      // ✅ 에러 로깅 방식을 positional argument로 수정
+      log.e('[API] Unexpected error on path: $path', e, st);
+      // 그 외 예외는 일반 AppException으로 처리
+      throw AppException(e.toString());
+    }
+  }
+}\n\n// ====== lib/core/network/binance_ws_client.dart ======\n
+// lib/core/network/binance_ws_client.dart
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import '../../domain/entities/trade.dart';
+import '../config/binance_config.dart';
+
+class BinanceWsClient {
+  final _controller = StreamController<Trade>.broadcast();
+  WebSocketChannel? _channel;
+  List<String> _markets = [];
+
+  Stream<Trade> get stream => _controller.stream;
+
+  void connect(List<String> markets) {
+    _markets = markets;
+    _channel?.sink.close(); // 이전 연결 종료
+
+    final url = Uri.parse(BinanceConfig.streamUrl);
+    _channel = WebSocketChannel.connect(url);
+
+    final params = _markets.map((m) => '${m.toLowerCase()}@aggTrade').toList();
+    final subRequest = {'method': 'SUBSCRIBE', 'params': params, 'id': 1};
+    _channel!.sink.add(jsonEncode(subRequest));
+
+    _channel!.stream.listen(
+      (message) {
+        final Map<String, dynamic> data = jsonDecode(message);
+        if (data.containsKey('data')) {
+          final trade = Trade.fromBinance(data['data']);
+          _controller.add(trade);
+        }
+      },
+      onDone: () => _reconnect(),
+      onError: (err) => _reconnect(),
+      cancelOnError: true,
+    );
+  }
+
+  void _reconnect() {
+    Future.delayed(const Duration(seconds: 3), () => connect(_markets));
+  }
+
+  void dispose() {
+    _channel?.sink.close();
+    _controller.close();
+  }
+}\n\n// ====== lib/core/utils/logger.dart ======\n
+import 'package:logger/logger.dart';
+
+/// 앱 전체에서 사용할 전역 로거 인스턴스
+final Logger log = Logger(
+  printer: PrettyPrinter(
+    methodCount: 1,        // 로그 호출 스택을 한 줄만 표시
+    errorMethodCount: 8,   // 에러 발생 시 표시할 스택 트레이스 라인 수
+    lineLength: 120,       // 로그 한 줄의 최대 길이
+    colors: true,          // 로그 레벨별 컬러 적용
+    printEmojis: true,      // 로그 레벨별 이모지 적용
+    printTime: true,       // 타임스탬프 출력
+  ),
+  // 개발 중에는 모든 레벨의 로그를, 릴리즈 시에는 Level.warning 등으로 변경 가능
+  level: Level.debug,
+);\n\n// ====== lib/core/common/time_frame_types.dart ======\n
+import 'package:flutter/foundation.dart';
+
+/// 거래 필터 Enum (단위: USDT)
+///
+/// 바이낸스 환경에 맞춰 거래대금 필터의 기준을 USDT로 변경합니다.
+enum TradeFilter {
+  usdt10k(10000, '10K USDT'),
+  usdt30k(30000, '30K USDT'),
+  usdt50k(50000, '50K USDT'),
+  usdt100k(100000, '100K USDT'),
+  usdt300k(300000, '300K USDT'),
+  usdt500k(500000, '500K USDT');
+
+  const TradeFilter(this.value, this.displayName);
+  final double value;
+  final String displayName;
+
+  static List<TradeFilter> get supportedFilters => values.toList();
+}
+
+/// 거래 모드 Enum (거래소 무관)
+enum TradeMode {
+  accumulated('누적'),
+  range('구간');
+
+  const TradeMode(this.displayName);
+  final String displayName;
+
+  bool get isAccumulated => this == TradeMode.accumulated;
+}
+
+/// 거래 관련 설정 (거래소 무관)
+class TradeConfig {
+  /// 필터별로 UI에 표시할 최대 거래 내역 개수
+  static const int maxTradesPerFilter = 200;
+  
+  /// 중복 체결 ID를 걸러내기 위한 캐시 사이즈
+  static const int maxSeenIdsCacheSize = 1000;
+}
+
+/// 바이낸스 마켓 정보 엔티티
+///
+/// 바이낸스의 `/fapi/v1/exchangeInfo` 엔드포인트 응답을 기반으로 재구성합니다.
+@immutable
+class MarketInfo {
+  final String symbol;
+  final String pair;
+  final String status;
+  final String baseAsset;
+  final String quoteAsset;
+  final int pricePrecision;
+  final int quantityPrecision;
+
+  const MarketInfo({
+    required this.symbol,
+    required this.pair,
+    required this.status,
+    required this.baseAsset,
+    required this.quoteAsset,
+    required this.pricePrecision,
+    required this.quantityPrecision,
+  });
+
+  factory MarketInfo.fromJson(Map<String, dynamic> json) {
+    return MarketInfo(
+      symbol: json['symbol'] ?? '',
+      pair: json['pair'] ?? '',
+      status: json['status'] ?? '',
+      baseAsset: json['baseAsset'] ?? '',
+      quoteAsset: json['quoteAsset'] ?? '',
+      pricePrecision: json['pricePrecision'] ?? 0,
+      quantityPrecision: json['quantityPrecision'] ?? 0,
+    );
+  }
+}\n\n// ====== lib/core/error/app_exception.dart ======\n
+import 'package:dio/dio.dart';
+
+/// 앱의 최상위 커스텀 예외 클래스
+class AppException implements Exception {
+  final String message;
+  final StackTrace? stackTrace;
+
+  const AppException(this.message, [this.stackTrace]);
+
+  @override
+  String toString() => 'AppException: $message';
+}
+
+/// 네트워크(REST API) 관련 예외
+class NetworkException extends AppException {
+  final DioException? originalException;
+
+  const NetworkException(String message, {this.originalException, StackTrace? stackTrace})
+      : super(message, stackTrace);
+
+  factory NetworkException.fromDio(DioException dioError) {
+    final message = dioError.message ?? 'A network error occurred.';
+    return NetworkException(
+      message,
+      originalException: dioError,
+      stackTrace: dioError.stackTrace,
+    );
+  }
+
+  @override
+  String toString() => 'NetworkException: $message';
+}
+
+/// WebSocket 관련 예외
+class WebSocketException extends AppException {
+  const WebSocketException(String message, [StackTrace? stackTrace])
+      : super(message, stackTrace);
+      
+  @override
+  String toString() => 'WebSocketException: $message';
+}
+
+/// 데이터 파싱(JSON 등) 관련 예외
+class DataParsingException extends AppException {
+  const DataParsingException(String message, [StackTrace? stackTrace])
+      : super(message, stackTrace);
+
+  @override
+  String toString() => 'DataParsingException: $message';
+}

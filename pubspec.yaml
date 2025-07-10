@@ -116,9 +116,6 @@ flutter:
     - assets/icon.png
     - assets/common_app_bar_icon.webp
     - assets/app_information_icon.webp
-    - assets/images/
-    - assets/animations/
-    - assets/sounds/
     - assets/noonchit_intro_84frames.mp4
     - assets/icons/money/
     - assets/icons/sector/
