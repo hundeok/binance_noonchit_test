@@ -1,0 +1,624 @@
+\n\n// ====== lib/core/di/volume_provider.dart ======\n
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../data/repositories/volume_repository_impl.dart';
+import '../../domain/entities/volume.dart'; // ✅ 누락된 import 추가
+import '../../domain/repositories/volume_repository.dart';
+import '../../domain/usecases/volume_usecase.dart';
+import 'core_provider.dart';
+
+// ===================================================================
+// 1. Data & Domain Layer Providers
+// ===================================================================
+
+final volumeRepositoryProvider = Provider<VolumeRepository>((ref) {
+  final remoteDS = ref.watch(tradeRemoteDSProvider); 
+  final repo = VolumeRepositoryImpl(remoteDS);
+  ref.onDispose(() => repo.dispose());
+  return repo;
+});
+
+final volumeUsecaseProvider = Provider((ref) {
+  final usecase = VolumeUsecase(ref.watch(volumeRepositoryProvider));
+  return usecase;
+});
+
+
+// ===================================================================
+// 2. UI State & Final Data Provider
+// ===================================================================
+
+final volumeTimeFrameProvider = StateProvider<TimeFrame>((ref) => TimeFrame.min5);
+
+final volumeDataProvider = StreamProvider.autoDispose<List<Volume>>((ref) {
+  final timeFrame = ref.watch(volumeTimeFrameProvider);
+  final marketsAsync = ref.watch(marketsProvider);
+  final usecase = ref.read(volumeUsecaseProvider);
+
+  return marketsAsync.when(
+    data: (markets) {
+      if (markets.isEmpty) return const Stream.empty();
+      return usecase.watchVolumeRanking(timeFrame, markets);
+    },
+    loading: () => const Stream.empty(),
+    error: (e, st) => Stream.error(e, st),
+  );
+});\n\n// ====== lib/data/repositories/volume_repository_impl.dart ======\n
+// lib/data/repositories/volume_repository_impl.dart
+
+import 'dart:async';
+import 'package:collection/collection.dart'; // sorted를 위해 import 추가
+import '../../core/utils/logger.dart';
+import '../../domain/entities/trade.dart';
+import '../../domain/entities/volume.dart';
+import '../../domain/repositories/volume_repository.dart';
+import '../datasources/trade_remote_ds.dart';
+
+class VolumeRepositoryImpl implements VolumeRepository {
+  final TradeRemoteDataSource _remoteDataSource;
+
+  final Map<TimeFrame, StreamController<List<Volume>>> _controllers = {};
+  StreamSubscription? _rawTradeSub;
+  final Map<TimeFrame, Map<String, double>> _volumeCache = {};
+  final Map<TimeFrame, DateTime> _timeFrameStartTimes = {};
+  Timer? _batchUpdateTimer;
+  Timer? _resetCheckTimer;
+  bool _isInitialized = false;
+
+  VolumeRepositoryImpl(this._remoteDataSource) {
+    for (final tf in TimeFrame.values) {
+      _controllers[tf] = StreamController<List<Volume>>.broadcast();
+      _volumeCache[tf] = {};
+      _timeFrameStartTimes[tf] = DateTime.now();
+    }
+    _resetCheckTimer = Timer.periodic(const Duration(seconds: 15), (_) => _checkTimeFrameResets());
+  }
+
+  void _initialize(List<String> markets) {
+    if (_isInitialized) return;
+    _isInitialized = true;
+    final rawTradeStream = _remoteDataSource.watchTrades(markets);
+    _rawTradeSub = rawTradeStream.listen(_processTrade);
+    log.i('[VolumeRepo] Initialized.');
+  }
+
+  void _processTrade(Trade trade) {
+    for (final tf in TimeFrame.values) {
+      final cache = _volumeCache[tf]!;
+      cache[trade.market] = (cache[trade.market] ?? 0) + trade.totalValue;
+    }
+    _scheduleBatchUpdate();
+  }
+
+  void _scheduleBatchUpdate() {
+    _batchUpdateTimer?.cancel();
+    _batchUpdateTimer = Timer(const Duration(milliseconds: 100), _performBatchUpdate);
+  }
+
+  void _performBatchUpdate() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    for (final tf in TimeFrame.values) {
+      final cache = _volumeCache[tf]!;
+      final startTime = _timeFrameStartTimes[tf]!;
+      
+      final volumeList = cache.entries.map((entry) => Volume(
+            market: entry.key,
+            totalValue: entry.value,
+            lastUpdated: now,
+            timeFrame: tf,
+            timeFrameStart: startTime.millisecondsSinceEpoch,
+          ))
+      // ✅ sortedBy -> sorted로 변경하고, null 안정성 처리
+      .sorted((a, b) => b.totalValue.compareTo(a.totalValue));
+      
+      _controllers[tf]?.add(volumeList);
+    }
+  }
+
+  void _checkTimeFrameResets() {
+    final now = DateTime.now();
+    for (final tf in TimeFrame.values) {
+      final startTime = _timeFrameStartTimes[tf]!;
+      if (now.difference(startTime) >= tf.duration) {
+        _resetTimeFrame(tf, now);
+      }
+    }
+  }
+
+  void _resetTimeFrame(TimeFrame timeFrame, DateTime newStartTime) {
+    _volumeCache[timeFrame]?.clear();
+    _timeFrameStartTimes[timeFrame] = newStartTime;
+    _performBatchUpdate();
+  }
+
+  @override
+  Stream<List<Volume>> watchVolumeRanking(TimeFrame timeFrame, List<String> markets) {
+    _initialize(markets);
+    Future.microtask(_performBatchUpdate);
+    return _controllers[timeFrame]?.stream ?? const Stream.empty();
+  }
+
+  @override
+  void resetTimeFrame(TimeFrame timeFrame) {
+    _resetTimeFrame(timeFrame, DateTime.now());
+  }
+
+  @override
+  void resetAllTimeFrames() {
+    final now = DateTime.now();
+    for (final tf in TimeFrame.values) {
+      _resetTimeFrame(tf, now);
+    }
+  }
+
+  @override
+  void dispose() {
+    _rawTradeSub?.cancel();
+    _batchUpdateTimer?.cancel();
+    _resetCheckTimer?.cancel();
+    for (var controller in _controllers.values) {
+      controller.close();
+    }
+    log.i('[VolumeRepo] Disposed.');
+  }
+}\n\n// ====== lib/data/processors/volume_processor.dart ======\n
+\n\n// ====== lib/domain/repositories/volume_repository.dart ======\n
+import '../entities/trade.dart';
+import '../entities/volume.dart';
+
+/// 시간대별 거래량 데이터의 집계 및 제공을 담당하는 Repository 인터페이스
+abstract class VolumeRepository {
+  /// 지정된 시간대의 거래량 순위 스트림을 제공합니다.
+  Stream<List<Volume>> watchVolumeRanking(TimeFrame timeFrame, List<String> markets);
+
+  /// 특정 시간대의 누적 거래량을 수동으로 리셋합니다.
+  void resetTimeFrame(TimeFrame timeFrame);
+
+  /// 모든 시간대의 누적 거래량을 수동으로 리셋합니다.
+  void resetAllTimeFrames();
+
+  /// 리소스를 정리합니다.
+  void dispose();
+}\n\n// ====== lib/domain/usecases/volume_usecase.dart ======\n
+// lib/domain/usecases/volume_usecase.dart
+
+import '../entities/volume.dart';
+import '../repositories/volume_repository.dart';
+
+class VolumeUsecase {
+  final VolumeRepository _repository;
+
+  VolumeUsecase(this._repository);
+
+  Stream<List<Volume>> watchVolumeRanking(TimeFrame timeFrame, List<String> markets) {
+    return _repository.watchVolumeRanking(timeFrame, markets);
+  }
+
+  void resetTimeFrame(TimeFrame timeFrame) {
+    _repository.resetTimeFrame(timeFrame);
+  }
+
+  void resetAllTimeFrames() {
+    _repository.resetAllTimeFrames();
+  }
+
+  void dispose() {
+    _repository.dispose();
+  }
+}\n\n// ====== lib/domain/entities/volume.dart ======\n
+import 'package:equatable/equatable.dart';
+
+/// 거래량 데이터를 집계할 시간대(TimeFrame)를 정의하는 Enum
+enum TimeFrame {
+  min1(1, '1m'),
+  min3(3, '3m'),
+  min5(5, '5m'),
+  min15(15, '15m'),
+  min30(30, '30m'),
+  hour1(60, '1h'),
+  hour2(120, '2h'),
+  hour4(240, '4h'),
+  hour6(360, '6h'),
+  hour12(720, '12h'),
+  day1(1440, '1d'),
+  week1(10080, '1w');
+
+  const TimeFrame(this.minutes, this.displayName);
+  final int minutes;
+  final String displayName;
+
+  Duration get duration => Duration(minutes: minutes);
+}
+
+
+/// 마켓별, 시간대별 누적 거래량 정보를 담는 데이터 모델
+class Volume extends Equatable {
+  /// 마켓 심볼 (e.g., "BTCUSDT")
+  final String market;
+  
+  /// 해당 시간대 누적 거래대금 (단위: USDT)
+  final double totalValue;
+  
+  /// 마지막 업데이트 시각 (milliseconds from epoch)
+  final int lastUpdated;
+  
+  /// 데이터 집계 기준 시간대
+  final TimeFrame timeFrame;
+  
+  /// 현재 시간대(봉)가 시작된 시각 (milliseconds from epoch)
+  final int timeFrameStart;
+
+  const Volume({
+    required this.market,
+    required this.totalValue,
+    required this.lastUpdated,
+    required this.timeFrame,
+    required this.timeFrameStart,
+  });
+  
+  /// 코인 티커만 추출 (e.g., "BTCUSDT" -> "BTC")
+  String get ticker => market.replaceAll('USDT', '');
+
+  /// 현재 시간대(봉)가 끝나는 예정 시각
+  DateTime get timeFrameEnd =>
+      DateTime.fromMillisecondsSinceEpoch(timeFrameStart).add(timeFrame.duration);
+
+  /// 현재 시간대 남은 시간 (초)
+  int get remainingSeconds {
+    final remaining = timeFrameEnd.difference(DateTime.now()).inSeconds;
+    return remaining > 0 ? remaining : 0;
+  }
+  
+  @override
+  List<Object> get props => [market, timeFrame];
+}\n\n// ====== lib/presentation/controllers/volume_controller.dart ======\n
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../core/di/volume_provider.dart';
+import '../../domain/entities/volume.dart';
+import '../../domain/usecases/volume_usecase.dart';
+
+/// VolumePage의 UI 상태를 담는 불변 클래스
+class VolumeControllerState {
+  final bool isTop100;
+
+  const VolumeControllerState({this.isTop100 = false}); // 기본값 Top 50
+
+  VolumeControllerState copyWith({bool? isTop100}) {
+    return VolumeControllerState(isTop100: isTop100 ?? this.isTop100);
+  }
+}
+
+/// VolumePage의 상태와 로직을 관리하는 컨트롤러
+class VolumeController extends StateNotifier<VolumeControllerState> {
+  final Ref _ref;
+
+  VolumeController(this._ref) : super(const VolumeControllerState());
+
+  // --- UI 상태 변경 메서드 ---
+
+  /// Top 50과 Top 100 표시를 토글합니다.
+  void toggleTopLimit() {
+    state = state.copyWith(isTop100: !state.isTop100);
+  }
+
+  /// 시간대(TimeFrame)를 변경합니다.
+  void setTimeFrame(TimeFrame newTimeFrame) {
+    _ref.read(volumeTimeFrameProvider.notifier).state = newTimeFrame;
+  }
+
+  // --- 비즈니스 로직 호출 메서드 ---
+
+  /// 현재 시간대의 거래량을 리셋합니다.
+  void resetCurrentTimeFrame() {
+    final usecase = _ref.read(volumeUsecaseProvider);
+    final currentTimeFrame = _ref.read(volumeTimeFrameProvider);
+    usecase.resetTimeFrame(currentTimeFrame);
+  }
+
+  // --- UI에 필요한 데이터 getter ---
+
+  /// 현재 선택된 시간대
+  TimeFrame get currentTimeFrame => _ref.watch(volumeTimeFrameProvider);
+  
+  /// 사용 가능한 모든 시간대 목록
+  List<TimeFrame> get availableTimeFrames => TimeFrame.values;
+  
+  /// 현재 표시할 목록 개수 (50 또는 100)
+  int get currentLimit => state.isTop100 ? 100 : 50;
+  
+  /// 현재 표시 모드 이름
+  String get currentLimitName => state.isTop100 ? 'Top 100' : 'Top 50';
+}
+
+
+/// VolumeController를 제공하는 최종 Provider
+final volumeControllerProvider =
+    StateNotifierProvider.autoDispose<VolumeController, VolumeControllerState>((ref) {
+  return VolumeController(ref);
+});\n\n// ====== lib/presentation/pages/volume_page.dart ======\n
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../core/common/time_frame_types.dart';
+import '../../core/di/volume_provider.dart';
+import '../../domain/entities/volume.dart';
+import '../controllers/volume_controller.dart';
+import '../widgets/volume_tile.dart';
+
+class VolumePage extends ConsumerWidget {
+  const VolumePage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final volumeDataAsync = ref.watch(volumeDataProvider);
+    final uiState = ref.watch(volumeControllerProvider);
+    final controller = ref.read(volumeControllerProvider.notifier);
+    
+    return Column(
+      children: [
+        // ✅ [수정] ref를 전달하여 오류 해결
+        _buildControls(context, ref, controller, uiState),
+        const Divider(height: 1),
+        Expanded(
+          child: volumeDataAsync.when(
+            data: (volumes) => _buildVolumeList(context, volumes, uiState),
+            loading: () => const Center(child: CircularProgressIndicator()),
+            error: (e, st) => Center(child: Text('Error: $e')),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildControls(BuildContext context, WidgetRef ref, VolumeController controller, VolumeControllerState uiState) {
+    final currentTimeFrame = controller.currentTimeFrame;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Text(
+                'Timeframe: ${currentTimeFrame.displayName}',
+                style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold),
+              ),
+              _buildTopLimitToggle(controller, uiState),
+              // ✅ [수정] ref를 전달하여 오류 해결
+              _buildCountdownWidget(context, ref),
+            ],
+          ),
+          Slider(
+            value: TimeFrame.values.indexOf(currentTimeFrame).toDouble(),
+            min: 0,
+            max: (controller.availableTimeFrames.length - 1).toDouble(),
+            divisions: controller.availableTimeFrames.length - 1,
+            label: currentTimeFrame.displayName,
+            onChanged: (value) {
+              final newTimeFrame = controller.availableTimeFrames[value.round()];
+              controller.setTimeFrame(newTimeFrame);
+            },
+            onChangeEnd: (_) => HapticFeedback.mediumImpact(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTopLimitToggle(VolumeController controller, VolumeControllerState uiState) {
+    return GestureDetector(
+      onTap: () {
+        HapticFeedback.lightImpact();
+        controller.toggleTopLimit();
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          // ✅ [수정] .withOpacity -> .withAlpha로 변경
+          color: uiState.isTop100 ? Colors.orange.withAlpha(51) : Colors.transparent, // 0.2 opacity
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.orange.withAlpha(179), width: 1.5), // 0.7 opacity
+        ),
+        child: Text(
+          controller.currentLimitName,
+          style: const TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: Colors.orange,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCountdownWidget(BuildContext context, WidgetRef ref) {
+    final volumeData = ref.watch(volumeDataProvider);
+    final remainingSeconds = volumeData.when(
+      data: (volumes) => volumes.isNotEmpty ? volumes.first.remainingSeconds : 0,
+      loading: () => 0,
+      error: (_, __) => 0,
+    );
+    
+    final minutes = remainingSeconds ~/ 60;
+    final seconds = remainingSeconds % 60;
+    final timeStr = '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.timer_outlined, size: 16, color: Theme.of(context).hintColor),
+        const SizedBox(width: 4),
+        SizedBox(
+          width: 42,
+          child: Text(
+            timeStr,
+            style: const TextStyle(
+              fontSize: 14,
+              color: Colors.orange,
+              fontWeight: FontWeight.bold,
+              fontFamily: 'monospace',
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildVolumeList(BuildContext context, List<Volume> volumes, VolumeControllerState uiState) {
+    if (volumes.isEmpty) {
+      return const Center(child: Text('거래량 데이터가 없습니다.'));
+    }
+    
+    final limitedList = volumes.take(uiState.isTop100 ? 100 : 50).toList();
+    
+    return RawScrollbar(
+      thumbVisibility: true,
+      thickness: 8,
+      radius: const Radius.circular(4),
+      child: ListView.builder(
+        primary: false,
+        padding: const EdgeInsets.symmetric(vertical: 4.0, horizontal: 12.0),
+        itemCount: limitedList.length,
+        itemBuilder: (context, index) => VolumeTile(
+          volume: limitedList[index],
+          rank: index + 1,
+        ),
+      ),
+    );
+  }
+}\n\n// ====== lib/presentation/widgets/volume_tile.dart ======\n
+import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import '../../domain/entities/volume.dart';
+
+final Map<String, int> _previousRanks = {};
+
+class VolumeTile extends StatefulWidget {
+  final Volume volume;
+  final int rank;
+
+  const VolumeTile({
+    Key? key,
+    required this.volume,
+    required this.rank,
+  }) : super(key: key);
+
+  @override
+  State<VolumeTile> createState() => _VolumeTileState();
+}
+
+class _VolumeTileState extends State<VolumeTile> with SingleTickerProviderStateMixin {
+  late AnimationController _animationController;
+  late Animation<Color?> _colorAnimation;
+
+  static final _volumeFormatter = NumberFormat.compact(locale: 'en_US');
+
+  @override
+  void initState() {
+    super.initState();
+    _animationController = AnimationController(
+      duration: const Duration(milliseconds: 750),
+      vsync: this,
+    );
+    _colorAnimation = ColorTween(begin: Colors.transparent, end: Colors.transparent)
+        .animate(_animationController);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _checkRankChange();
+    });
+  }
+
+  @override
+  void didUpdateWidget(VolumeTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.rank != oldWidget.rank) {
+      _checkRankChange();
+    }
+  }
+
+  void _checkRankChange() {
+    final previousRank = _previousRanks[widget.volume.market];
+    final currentRank = widget.rank;
+    
+    if (previousRank != null && currentRank < previousRank) {
+      _colorAnimation = ColorTween(
+        begin: Colors.green.withAlpha(102), // 0.4 opacity
+        end: Colors.transparent,
+      ).animate(CurvedAnimation(parent: _animationController, curve: Curves.easeOut));
+      _animationController.forward(from: 0.0);
+    }
+    
+    _previousRanks[widget.volume.market] = currentRank;
+  }
+  
+  @override
+  void dispose() {
+    _animationController.dispose();
+    super.dispose();
+  }
+  
+  Color _getRankColor(BuildContext context) {
+    if (widget.rank <= 3) return Colors.amber.shade600;
+    if (widget.rank <= 10) return Theme.of(context).colorScheme.primary;
+    // ✅ [수정] .withOpacity -> .withAlpha로 변경
+    return Theme.of(context).colorScheme.onSurface.withAlpha(179); // 0.7 opacity
+  }
+  
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final rankColor = _getRankColor(context);
+
+    return AnimatedBuilder(
+      animation: _colorAnimation,
+      builder: (context, child) {
+        return Container(
+          margin: const EdgeInsets.symmetric(vertical: 3.0),
+          decoration: BoxDecoration(
+            color: _colorAnimation.value,
+            borderRadius: BorderRadius.circular(8.0),
+          ),
+          child: child,
+        );
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 14.0),
+        child: Row(
+          children: [
+            Text(
+              '${widget.rank}',
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: rankColor,
+                fontWeight: FontWeight.bold,
+                fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              flex: 4,
+              child: Text(
+                widget.volume.ticker,
+                style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            Expanded(
+              flex: 5,
+              child: Text(
+                '\$${_volumeFormatter.format(widget.volume.totalValue)}',
+                textAlign: TextAlign.end,
+                style: theme.textTheme.bodyLarge?.copyWith(
+                  fontFamily: 'monospace',
+                  fontWeight: FontWeight.w500,
+                  color: theme.colorScheme.onSurface,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

@@ -28,7 +28,7 @@ class TradeWsClient extends BaseWsClient<Trade> {
         );
 
   // ===================================================================
-  // 📨 계층적 멀티 스트림 구독 메시지 인코딩 (중복 방지)
+  // 📨 멀티 스트림 구독 메시지 인코딩 (바이낸스 백서 준수)
   // ===================================================================
 
   static String _encodeSubscribeMessage(List<String> markets, StreamSubscriptionConfig config) {
@@ -41,49 +41,40 @@ class TradeWsClient extends BaseWsClient<Trade> {
           'Binance limit: ${AppConfig.wsMaxStreams} streams per connection.');
     }
 
-    // ===================================================================
-    // 🎯 계층적 구독 전략 (Tiered Subscription)
-    // ===================================================================
-    
-    // 상위 심볼들: 모든 스트림으로 완전 분석
-    final coreSymbols = markets.take(config.aggTradeCount);
-    final coreSymbolsList = coreSymbols.toList();
-    
-    log.i('[TradeWS] 🎯 Core symbols (완전 분석): ${coreSymbolsList.length}개');
-    
-    // ✅ 1. aggTrade 스트림 (상위 심볼만 - 상세 거래 데이터)
+    // ✅ 1. aggTrade 스트림 (상세 거래 데이터)
     if (config.aggTradeCount > 0) {
+      final aggTradeMarkets = markets.take(config.aggTradeCount);
       params.addAll(
-        coreSymbolsList.map((symbol) => '${symbol.toLowerCase()}@aggTrade'),
+        aggTradeMarkets.map((symbol) => '${symbol.toLowerCase()}@aggTrade'),
       );
-      log.i('[TradeWS] 📈 Added ${coreSymbolsList.length} aggTrade streams (Core tier)');
+      log.i('[TradeWS] 📈 Added ${aggTradeMarkets.length} aggTrade streams');
     }
 
-    // ✅ 2. ticker 스트림 (상위 + 중위 심볼들)
+    // ✅ 2. ticker 스트림 (24시간 통계)
     if (config.tickerCount > 0) {
-      final tickerSymbols = markets.take(config.tickerCount).toList();
+      final tickerMarkets = markets.take(config.tickerCount);
       params.addAll(
-        tickerSymbols.map((symbol) => '${symbol.toLowerCase()}@ticker'),
+        tickerMarkets.map((symbol) => '${symbol.toLowerCase()}@ticker'),
       );
-      log.i('[TradeWS] 📊 Added ${tickerSymbols.length} ticker streams (Core + Mid tier)');
+      log.i('[TradeWS] 📊 Added ${tickerMarkets.length} ticker streams');
     }
 
-    // ✅ 3. bookTicker 스트림 (상위 심볼만 - 정밀 호가 데이터)
+    // ✅ 3. bookTicker 스트림 (최고 호가)
     if (config.bookTickerCount > 0) {
-      final bookTickerSymbols = coreSymbolsList.take(config.bookTickerCount).toList();
+      final bookTickerMarkets = markets.take(config.bookTickerCount);
       params.addAll(
-        bookTickerSymbols.map((symbol) => '${symbol.toLowerCase()}@bookTicker'),
+        bookTickerMarkets.map((symbol) => '${symbol.toLowerCase()}@bookTicker'),
       );
-      log.i('[TradeWS] 💰 Added ${bookTickerSymbols.length} bookTicker streams (Core tier only)');
+      log.i('[TradeWS] 💰 Added ${bookTickerMarkets.length} bookTicker streams');
     }
 
-    // ✅ 4. depth5 스트림 (상위 심볼만 - 세부 호가창)
+    // ✅ 4. depth5 스트림 (5단계 호가창)
     if (config.depth5Count > 0) {
-      final depth5Symbols = coreSymbolsList.take(config.depth5Count).toList();
+      final depth5Markets = markets.take(config.depth5Count);
       params.addAll(
-        depth5Symbols.map((symbol) => '${symbol.toLowerCase()}@depth5'),
+        depth5Markets.map((symbol) => '${symbol.toLowerCase()}@depth5'),
       );
-      log.i('[TradeWS] 📋 Added ${depth5Symbols.length} depth5 streams (Core tier only)');
+      log.i('[TradeWS] 📋 Added ${depth5Markets.length} depth5 streams');
     }
 
     final messageId = _generateUniqueMessageId();
@@ -95,25 +86,20 @@ class TradeWsClient extends BaseWsClient<Trade> {
 
     final jsonMessage = jsonEncode(subscribeMessage);
 
-    log.i('[TradeWS] 🎯 계층적 구독 완료 - 총 ${params.length}개 스트림');
-    log.i('[TradeWS] - Core tier (${coreSymbolsList.length}개): 모든 스트림으로 완전 분석');
-    log.i('[TradeWS] - Mid tier (${config.tickerCount - coreSymbolsList.length}개): ticker로 기본 모니터링');
+    log.i('[TradeWS] 🎯 총 ${params.length}개 스트림 구독 (Markets: ${markets.length})');
     log.d('[TradeWS] Subscription message: $jsonMessage');
 
     return jsonMessage;
   }
 
-  /// 총 스트림 개수 계산 (계층적 구독 고려)
+  /// 총 스트림 개수 계산
   static int _calculateTotalStreams(int marketCount, StreamSubscriptionConfig config) {
-    // Core tier: aggTrade 개수만큼의 심볼이 모든 스트림 구독
-    final coreSymbolCount = config.aggTradeCount > marketCount ? marketCount : config.aggTradeCount;
-    final coreStreams = coreSymbolCount * 4; // aggTrade + ticker + bookTicker + depth5
-    
-    // Mid tier: ticker만 추가 구독 (core tier 제외)
-    final midSymbolCount = (config.tickerCount - coreSymbolCount).clamp(0, marketCount - coreSymbolCount);
-    final midStreams = midSymbolCount; // ticker만
-    
-    return coreStreams + midStreams;
+    return [
+      config.aggTradeCount,
+      config.tickerCount,
+      config.bookTickerCount,
+      config.depth5Count,
+    ].map((count) => count > marketCount ? marketCount : count).fold(0, (a, b) => a + b);
   }
 
   /// 🎯 바이낸스 호환 고유 메시지 ID 생성 (String 반환)
@@ -318,12 +304,12 @@ class TradeWsClient extends BaseWsClient<Trade> {
   }
 }
 
-/// ✅ 계층적 스트림 구독 설정 클래스
+/// ✅ 스트림 구독 설정 클래스
 class StreamSubscriptionConfig {
-  final int aggTradeCount;     // Core tier 심볼 수 (모든 스트림 구독)
-  final int tickerCount;       // Core + Mid tier 심볼 수 (ticker 구독)  
-  final int bookTickerCount;   // Core tier에서 bookTicker 구독할 심볼 수
-  final int depth5Count;       // Core tier에서 depth5 구독할 심볼 수
+  final int aggTradeCount;     // aggTrade 스트림 개수
+  final int tickerCount;       // ticker 스트림 개수  
+  final int bookTickerCount;   // bookTicker 스트림 개수
+  final int depth5Count;       // depth5 스트림 개수
 
   const StreamSubscriptionConfig({
     this.aggTradeCount = 0,
@@ -332,83 +318,33 @@ class StreamSubscriptionConfig {
     this.depth5Count = 0,
   });
 
-  /// 🎯 계층적 기본 설정 (Core 30개 완전분석 + Mid 120개 기본모니터링)
+  /// 기본 설정 (우리가 계획한 400개 스트림)
   factory StreamSubscriptionConfig.defaultConfig() {
     return const StreamSubscriptionConfig(
-      aggTradeCount: 30,    // Core: 상위 30개 심볼 (모든 스트림)
-      tickerCount: 150,     // Core 30개 + Mid 120개 (ticker)
-      bookTickerCount: 30,  // Core 30개만 (호가 데이터)
-      depth5Count: 30,      // Core 30개만 (세부 호가)
+      aggTradeCount: 100,    // Trade + Volume용
+      tickerCount: 150,      // Surge용
+      bookTickerCount: 100,  // 호가용
+      depth5Count: 50,       // 세부 호가용
     );
-    // 결과: Core 30개는 4개 스트림, Mid 120개는 1개 스트림
-    // 총 스트림: (30 * 4) + (120 * 1) = 240개
   }
 
-  /// 보수적 설정 (Core 20개 + Mid 30개)
+  /// aggTrade만 구독 (기존 방식 호환)
+  factory StreamSubscriptionConfig.aggTradeOnly(int count) {
+    return StreamSubscriptionConfig(aggTradeCount: count);
+  }
+
+  /// 보수적 설정 (적은 스트림)
   factory StreamSubscriptionConfig.conservative() {
     return const StreamSubscriptionConfig(
-      aggTradeCount: 20,    // Core: 상위 20개만
-      tickerCount: 50,      // Core 20개 + Mid 30개
-      bookTickerCount: 20,  // Core 20개만
-      depth5Count: 20,      // Core 20개만
-    );
-    // 총 스트림: (20 * 4) + (30 * 1) = 110개
-  }
-
-  /// 집중 분석 설정 (Core 50개 완전분석)
-  factory StreamSubscriptionConfig.intensive() {
-    return const StreamSubscriptionConfig(
-      aggTradeCount: 50,    // Core: 상위 50개 심볼
-      tickerCount: 100,     // Core 50개 + Mid 50개
-      bookTickerCount: 50,  // Core 50개 전체
-      depth5Count: 50,      // Core 50개 전체  
-    );
-    // 총 스트림: (50 * 4) + (50 * 1) = 250개
-  }
-
-  /// aggTrade만 구독 (기존 호환)
-  factory StreamSubscriptionConfig.aggTradeOnly(int count) {
-    return StreamSubscriptionConfig(
-      aggTradeCount: count,
-      tickerCount: count,    // aggTrade와 같은 심볼에 ticker도 추가
-      bookTickerCount: 0,
-      depth5Count: 0,
+      aggTradeCount: 30,
+      tickerCount: 50,
+      bookTickerCount: 30,
+      depth5Count: 20,
     );
   }
 
-  /// Core tier 심볼 개수 (모든 스트림 구독)
-  int get coreSymbolCount => aggTradeCount;
-  
-  /// Mid tier 심볼 개수 (ticker만 구독)
-  int get midSymbolCount => (tickerCount - aggTradeCount).clamp(0, double.infinity).toInt();
-
-  /// 총 구독 심볼 개수
-  int get totalSymbolCount => tickerCount;
-
-  /// 총 스트림 개수 (계층적 계산)
-  int get totalStreamCount {
-    final coreStreams = coreSymbolCount * 4; // 4개 스트림씩
-    final midStreams = midSymbolCount * 1;   // 1개 스트림씩
-    return coreStreams + midStreams;
-  }
-
-  /// 계층별 구성 정보
-  Map<String, dynamic> getTierBreakdown() {
-    return {
-      'core': {
-        'symbolCount': coreSymbolCount,
-        'streams': ['aggTrade', 'ticker', 'bookTicker', 'depth5'],
-        'streamCount': coreSymbolCount * 4,
-        'description': '완전 분석 (모든 스트림)',
-      },
-      'mid': {
-        'symbolCount': midSymbolCount,
-        'streams': ['ticker'],
-        'streamCount': midSymbolCount * 1,
-        'description': '기본 모니터링 (ticker만)',
-      },
-    };
-  }
+  /// 총 스트림 개수
+  int get totalCount => aggTradeCount + tickerCount + bookTickerCount + depth5Count;
 
   /// 맵으로 변환
   Map<String, dynamic> toMap() {
@@ -417,16 +353,13 @@ class StreamSubscriptionConfig {
       'tickerCount': tickerCount,
       'bookTickerCount': bookTickerCount,
       'depth5Count': depth5Count,
-      'coreSymbolCount': coreSymbolCount,
-      'midSymbolCount': midSymbolCount,
-      'totalSymbolCount': totalSymbolCount,
-      'totalStreamCount': totalStreamCount,
-      'tierBreakdown': getTierBreakdown(),
+      'totalCount': totalCount,
     };
   }
 
   @override
   String toString() {
-    return 'StreamConfig(Core: ${coreSymbolCount}개 완전분석, Mid: ${midSymbolCount}개 기본모니터링, 총 ${totalStreamCount}개 스트림)';
+    return 'StreamConfig(aggTrade: $aggTradeCount, ticker: $tickerCount, '
+           'bookTicker: $bookTickerCount, depth5: $depth5Count, total: $totalCount)';
   }
 }

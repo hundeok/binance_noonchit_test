@@ -6,32 +6,48 @@ import '../../data/datasources/trade_remote_ds.dart';
 import '../../data/repositories/trade_repository_impl.dart';
 import '../../domain/entities/trade.dart';
 import '../../domain/repositories/trade_repository.dart';
-import '../common/time_frame_types.dart';
+import '../common/time_frame_types.dart'; // TradeFilter enum이 정의된 경로
 import '../config/app_config.dart';
 import '../network/api_client.dart';
 import '../utils/logger.dart';
 import 'websocket_provider.dart';
 
 // ===================================================================
-// 1. Service & Data Layer Providers
+// 0. Configuration Constants
 // ===================================================================
 
+class TradeConfig {
+  static const int maxSeenIdsCacheSize = 10000;
+  static const int maxTradesPerFilter = 100;
+}
+
+// ===================================================================
+// 1. Foundational Service & Data Layer Providers
+// ===================================================================
+
+/// API 클라이언트 인스턴스를 제공합니다.
 final apiClientProvider = Provider((_) => ApiClient());
-final tradeRemoteDSProvider = Provider((ref) => TradeRemoteDataSource(ref.watch(wsClientProvider)));
+
+/// 원격 데이터 소스(WebSocket)를 제공합니다.
+final tradeRemoteDSProvider = Provider((ref) {
+  return TradeRemoteDataSource(ref.watch(wsClientProvider));
+});
+
+/// 거래 데이터 Repository를 제공합니다.
 final tradeRepositoryProvider = Provider<TradeRepository>((ref) {
   final repo = TradeRepositoryImpl(ref.watch(tradeRemoteDSProvider));
-  // ✅ Provider가 소멸될 때 Repository의 dispose 메서드 호출
   ref.onDispose(() => repo.dispose());
   return repo;
 });
-
 
 // ===================================================================
 // 2. Market Info & Raw Data Stream Providers
 // ===================================================================
 
-final marketsProvider = FutureProvider.autoDispose<List<String>>((ref) async {
-  log.d('Fetching top volume markets from Binance...');
+/// 바이낸스 API에서 거래량 상위 종목 목록을 가져옵니다.
+/// ✅ [수정] .autoDispose를 제거하여, 앱 세션 동안 종목 리스트를 단 한 번만 가져오도록 최적화합니다.
+final marketsProvider = FutureProvider<List<String>>((ref) async {
+  log.d('[marketsProvider] Fetching top volume markets from Binance...');
   final client = ref.watch(apiClientProvider);
   try {
     final List<dynamic> tickers = await client.get('/fapi/v1/ticker/24hr');
@@ -43,25 +59,22 @@ final marketsProvider = FutureProvider.autoDispose<List<String>>((ref) async {
       return volumeB.compareTo(volumeA);
     });
 
-    final markets = tickers.map((t) => t['symbol'] as String).take(AppConfig.wsMaxSubscriptions).toList();
-    log.i('Fetched ${markets.length} markets, sorted by volume.');
+    final markets = tickers.map((t) => t['symbol'] as String)
+                           .take(AppConfig.wsMaxSubscriptions)
+                           .toList();
+                           
+    log.i('[marketsProvider] Fetched ${markets.length} markets, sorted by volume.');
     return markets;
   } catch (e, st) {
-    log.e('Failed to fetch Binance markets', e, st);
-    return ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+    log.e('[marketsProvider] Failed to fetch Binance markets', e, st);
+    throw Exception('Failed to fetch markets: $e');
   }
 });
 
+/// WebSocket 클라이언트로부터 들어오는 가공되지 않은 '거래' 데이터 스트림을 제공합니다.
 final rawTradeStreamProvider = StreamProvider.autoDispose<Trade>((ref) {
-  final repo = ref.watch(tradeRepositoryProvider);
-  final marketsAsyncValue = ref.watch(marketsProvider);
-
-  return marketsAsyncValue.when(
-    // ✅ 수정된 부분: Repository 인터페이스에 정의된 `watchAggregatedTrades`를 사용
-    data: (markets) => markets.isEmpty ? const Stream.empty() : repo.watchAggregatedTrades(markets),
-    loading: () => const Stream.empty(),
-    error: (e, st) => Stream.error(e, st),
-  );
+  final client = ref.watch(wsClientProvider);
+  return client.stream;
 });
 
 
@@ -69,56 +82,61 @@ final rawTradeStreamProvider = StreamProvider.autoDispose<Trade>((ref) {
 // 3. Filtered Data & UI State Providers
 // ===================================================================
 
+/// UI에서 사용자가 선택한 거래대금 필터 값을 관리합니다.
 final tradeFilterProvider = StateProvider<TradeFilter>((ref) => TradeFilter.usdt50k);
 
+/// 최종적으로 필터링된 거래 목록을 UI에 제공합니다.
 final filteredTradesProvider = Provider.autoDispose<List<Trade>>((ref) {
-  final cache = ref.watch(_tradeCacheProvider);
   final filter = ref.watch(tradeFilterProvider);
-  return cache[filter] ?? [];
+  final filteredList = ref.watch(tradeCacheProvider.select((cache) => cache[filter]));
+  return filteredList ?? const [];
 });
 
-final _tradeCacheProvider = StateNotifierProvider.autoDispose<TradeCacheNotifier, Map<TradeFilter, List<Trade>>>((ref) {
+/// 거래 데이터를 필터별로 캐싱하고 관리하는 핵심 로직을 담당합니다.
+final tradeCacheProvider = StateNotifierProvider.autoDispose<
+    TradeCacheNotifier, Map<TradeFilter, List<Trade>>>((ref) {
   return TradeCacheNotifier(ref);
 });
 
 class TradeCacheNotifier extends StateNotifier<Map<TradeFilter, List<Trade>>> {
   final Ref _ref;
-  final _seenIds = LinkedHashSet<String>();
+  final Queue<String> _seenIds = Queue();
   ProviderSubscription? _sub;
 
   TradeCacheNotifier(this._ref)
-      : super({ for (var filter in TradeFilter.values) filter: [] }) {
+      : super({for (var filter in TradeFilter.values) filter: const []}) {
     _sub = _ref.listen<AsyncValue<Trade>>(
       rawTradeStreamProvider,
-      (previous, next) {
-        next.whenData(_processTrade);
-      },
-      fireImmediately: true,
+      (_, next) => next.whenData(_processTrade),
     );
   }
   
   void _processTrade(Trade trade) {
-    if (!_seenIds.add(trade.tradeId)) return;
+    if (_seenIds.contains(trade.tradeId)) return;
+
+    _seenIds.addLast(trade.tradeId);
     if (_seenIds.length > TradeConfig.maxSeenIdsCacheSize) {
-      _seenIds.remove(_seenIds.first);
+      _seenIds.removeFirst();
     }
     
-    final currentCache = Map.of(state);
+    final newState = Map.of(state); 
     bool needsUpdate = false;
 
     for (final filter in TradeFilter.values) {
       if (trade.totalValue >= filter.value) {
-        final list = currentCache[filter]!;
-        list.insert(0, trade);
-        if (list.length > TradeConfig.maxTradesPerFilter) {
-          currentCache[filter] = list.sublist(0, TradeConfig.maxTradesPerFilter);
-        }
+        final oldList = newState[filter]!;
+        final newList = [trade, ...oldList];
+        
+        newState[filter] = newList.length > TradeConfig.maxTradesPerFilter 
+            ? newList.sublist(0, TradeConfig.maxTradesPerFilter) 
+            : newList;
+            
         needsUpdate = true;
       }
     }
     
     if (needsUpdate) {
-      state = currentCache;
+      state = newState;
     }
   }
   

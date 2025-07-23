@@ -1,0 +1,2923 @@
+\n\n// ====== lib/core/di/trade_provider.dart ======\n
+\n\n// ====== lib/core/di/websocket_provider.dart ======\n
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../network/websocket/base_ws_client.dart';
+import '../network/websocket/trade_ws_client.dart';
+import '../utils/logger.dart';
+import 'core_provider.dart';
+
+@immutable
+class WebSocketState {
+  final WsStatus status;
+  final List<String> subscribedSymbols;
+  final DateTime? lastConnectedAt;
+
+  const WebSocketState({
+    this.status = WsStatus.disconnected,
+    this.subscribedSymbols = const [],
+    this.lastConnectedAt,
+  });
+
+  WebSocketState copyWith({
+    WsStatus? status,
+    List<String>? subscribedSymbols,
+    DateTime? lastConnectedAt,
+  }) {
+    return WebSocketState(
+      status: status ?? this.status,
+      subscribedSymbols: subscribedSymbols ?? this.subscribedSymbols,
+      lastConnectedAt: lastConnectedAt ?? this.lastConnectedAt,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+  
+    return other is WebSocketState &&
+      other.status == status &&
+      listEquals(other.subscribedSymbols, subscribedSymbols) &&
+      other.lastConnectedAt == lastConnectedAt;
+  }
+
+  @override
+  int get hashCode => status.hashCode ^ subscribedSymbols.hashCode ^ lastConnectedAt.hashCode;
+}
+
+final wsClientProvider = Provider.autoDispose<TradeWsClient>((ref) {
+  final client = TradeWsClient();
+  ref.onDispose(client.dispose);
+  return client;
+});
+
+final webSocketManagerProvider =
+    StateNotifierProvider.autoDispose<WebSocketManager, WebSocketState>(
+  (ref) => WebSocketManager(ref),
+);
+
+class WebSocketManager extends StateNotifier<WebSocketState> {
+  final Ref _ref;
+
+  WebSocketManager(this._ref) : super(const WebSocketState()) {
+    // ✅ 이제 이 코드는 정상적으로 동작합니다.
+    _ref.read(wsClientProvider).onStatusChange = (newStatus) {
+      if (state.status != newStatus) {
+        state = state.copyWith(
+          status: newStatus,
+          lastConnectedAt: newStatus == WsStatus.connected ? DateTime.now() : state.lastConnectedAt,
+        );
+      }
+    };
+  }
+
+  Future<void> connect() async {
+    if (state.status == WsStatus.connecting || state.status == WsStatus.connected) {
+      log.w('[WebSocketManager] Already connected or connecting.');
+      return;
+    }
+
+    state = state.copyWith(status: WsStatus.connecting);
+
+    try {
+      final markets = await _ref.read(marketsProvider.future);
+      if (markets.isEmpty) {
+        throw Exception('Cannot connect without markets.');
+      }
+      
+      _ref.read(wsClientProvider).connect(markets);
+      
+      state = state.copyWith(subscribedSymbols: markets);
+      log.i('[WebSocketManager] Connect command issued with ${markets.length} markets.');
+
+    } catch (e, st) {
+      log.e('[WebSocketManager] Connection failed.', e, st);
+      state = state.copyWith(status: WsStatus.disconnected);
+    }
+  }
+
+  void disconnect() {
+    log.i('[WebSocketManager] Disconnect command issued.');
+    _ref.read(wsClientProvider).dispose();
+    state = const WebSocketState(); 
+  }
+}\n\n// ====== lib/core/di/volume_provider.dart ======\n
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../data/repositories/volume_repository_impl.dart';
+import '../../domain/entities/volume.dart'; // ✅ 누락된 import 추가
+import '../../domain/repositories/volume_repository.dart';
+import '../../domain/usecases/volume_usecase.dart';
+import 'core_provider.dart';
+
+// ===================================================================
+// 1. Data & Domain Layer Providers
+// ===================================================================
+
+final volumeRepositoryProvider = Provider<VolumeRepository>((ref) {
+  final remoteDS = ref.watch(tradeRemoteDSProvider); 
+  final repo = VolumeRepositoryImpl(remoteDS);
+  ref.onDispose(() => repo.dispose());
+  return repo;
+});
+
+final volumeUsecaseProvider = Provider((ref) {
+  final usecase = VolumeUsecase(ref.watch(volumeRepositoryProvider));
+  return usecase;
+});
+
+
+// ===================================================================
+// 2. UI State & Final Data Provider
+// ===================================================================
+
+final volumeTimeFrameProvider = StateProvider<TimeFrame>((ref) => TimeFrame.min5);
+
+final volumeDataProvider = StreamProvider.autoDispose<List<Volume>>((ref) {
+  final timeFrame = ref.watch(volumeTimeFrameProvider);
+  final marketsAsync = ref.watch(marketsProvider);
+  final usecase = ref.read(volumeUsecaseProvider);
+
+  return marketsAsync.when(
+    data: (markets) {
+      if (markets.isEmpty) return const Stream.empty();
+      return usecase.watchVolumeRanking(timeFrame, markets);
+    },
+    loading: () => const Stream.empty(),
+    error: (e, st) => Stream.error(e, st),
+  );
+});\n\n// ====== lib/core/di/core_provider.dart ======\n
+import 'dart:async';
+import 'dart:collection';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../data/datasources/trade_remote_ds.dart';
+import '../../data/repositories/trade_repository_impl.dart';
+import '../../domain/entities/trade.dart';
+import '../../domain/repositories/trade_repository.dart';
+import '../common/time_frame_types.dart'; // TradeFilter enum이 정의된 경로
+import '../config/app_config.dart';
+import '../network/api_client.dart';
+import '../utils/logger.dart';
+import 'websocket_provider.dart';
+
+// ===================================================================
+// 0. Configuration Constants
+// ===================================================================
+
+class TradeConfig {
+  static const int maxSeenIdsCacheSize = 10000;
+  static const int maxTradesPerFilter = 100;
+}
+
+// ===================================================================
+// 1. Foundational Service & Data Layer Providers
+// ===================================================================
+
+/// API 클라이언트 인스턴스를 제공합니다.
+final apiClientProvider = Provider((_) => ApiClient());
+
+/// 원격 데이터 소스(WebSocket)를 제공합니다.
+final tradeRemoteDSProvider = Provider((ref) {
+  return TradeRemoteDataSource(ref.watch(wsClientProvider));
+});
+
+/// 거래 데이터 Repository를 제공합니다.
+final tradeRepositoryProvider = Provider<TradeRepository>((ref) {
+  final repo = TradeRepositoryImpl(ref.watch(tradeRemoteDSProvider));
+  ref.onDispose(() => repo.dispose());
+  return repo;
+});
+
+// ===================================================================
+// 2. Market Info & Raw Data Stream Providers
+// ===================================================================
+
+/// 바이낸스 API에서 거래량 상위 종목 목록을 가져옵니다.
+/// ✅ [수정] .autoDispose를 제거하여, 앱 세션 동안 종목 리스트를 단 한 번만 가져오도록 최적화합니다.
+final marketsProvider = FutureProvider<List<String>>((ref) async {
+  log.d('[marketsProvider] Fetching top volume markets from Binance...');
+  final client = ref.watch(apiClientProvider);
+  try {
+    final List<dynamic> tickers = await client.get('/fapi/v1/ticker/24hr');
+    
+    tickers.removeWhere((t) => !(t['symbol'] as String).endsWith('USDT'));
+    tickers.sort((a, b) {
+      final volumeA = double.tryParse(a['quoteVolume'].toString()) ?? 0;
+      final volumeB = double.tryParse(b['quoteVolume'].toString()) ?? 0;
+      return volumeB.compareTo(volumeA);
+    });
+
+    final markets = tickers.map((t) => t['symbol'] as String)
+                           .take(AppConfig.wsMaxSubscriptions)
+                           .toList();
+                           
+    log.i('[marketsProvider] Fetched ${markets.length} markets, sorted by volume.');
+    return markets;
+  } catch (e, st) {
+    log.e('[marketsProvider] Failed to fetch Binance markets', e, st);
+    throw Exception('Failed to fetch markets: $e');
+  }
+});
+
+/// WebSocket 클라이언트로부터 들어오는 가공되지 않은 '거래' 데이터 스트림을 제공합니다.
+final rawTradeStreamProvider = StreamProvider.autoDispose<Trade>((ref) {
+  final client = ref.watch(wsClientProvider);
+  return client.stream;
+});
+
+
+// ===================================================================
+// 3. Filtered Data & UI State Providers
+// ===================================================================
+
+/// UI에서 사용자가 선택한 거래대금 필터 값을 관리합니다.
+final tradeFilterProvider = StateProvider<TradeFilter>((ref) => TradeFilter.usdt50k);
+
+/// 최종적으로 필터링된 거래 목록을 UI에 제공합니다.
+final filteredTradesProvider = Provider.autoDispose<List<Trade>>((ref) {
+  final filter = ref.watch(tradeFilterProvider);
+  final filteredList = ref.watch(tradeCacheProvider.select((cache) => cache[filter]));
+  return filteredList ?? const [];
+});
+
+/// 거래 데이터를 필터별로 캐싱하고 관리하는 핵심 로직을 담당합니다.
+final tradeCacheProvider = StateNotifierProvider.autoDispose<
+    TradeCacheNotifier, Map<TradeFilter, List<Trade>>>((ref) {
+  return TradeCacheNotifier(ref);
+});
+
+class TradeCacheNotifier extends StateNotifier<Map<TradeFilter, List<Trade>>> {
+  final Ref _ref;
+  final Queue<String> _seenIds = Queue();
+  ProviderSubscription? _sub;
+
+  TradeCacheNotifier(this._ref)
+      : super({for (var filter in TradeFilter.values) filter: const []}) {
+    _sub = _ref.listen<AsyncValue<Trade>>(
+      rawTradeStreamProvider,
+      (_, next) => next.whenData(_processTrade),
+    );
+  }
+  
+  void _processTrade(Trade trade) {
+    if (_seenIds.contains(trade.tradeId)) return;
+
+    _seenIds.addLast(trade.tradeId);
+    if (_seenIds.length > TradeConfig.maxSeenIdsCacheSize) {
+      _seenIds.removeFirst();
+    }
+    
+    final newState = Map.of(state); 
+    bool needsUpdate = false;
+
+    for (final filter in TradeFilter.values) {
+      if (trade.totalValue >= filter.value) {
+        final oldList = newState[filter]!;
+        final newList = [trade, ...oldList];
+        
+        newState[filter] = newList.length > TradeConfig.maxTradesPerFilter 
+            ? newList.sublist(0, TradeConfig.maxTradesPerFilter) 
+            : newList;
+            
+        needsUpdate = true;
+      }
+    }
+    
+    if (needsUpdate) {
+      state = newState;
+    }
+  }
+  
+  @override
+  void dispose() {
+    _sub?.close();
+    super.dispose();
+  }
+}\n\n// ====== lib/core/config/app_config.dart ======\n
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import '../utils/logger.dart';
+
+/// 바이낸스 선물(USDⓈ-M) 전용 애플리케이션 설정
+/// 🎯 바이낸스 공식 WebSocket 백서 (2025-01-28) 100% 준수
+class AppConfig {
+  AppConfig._(); // 인스턴스화 방지
+
+  // ===================================================================
+  // 1. 환경 변수 및 토글
+  // ===================================================================
+  
+  /// 테스트넷 사용 여부. `dart --define=BINANCE_TESTNET=true`로 컴파일 시 true.
+  static const bool useTestnet = bool.fromEnvironment('BINANCE_TESTNET');
+  
+  static String apiKey = '';
+  static String apiSecret = '';
+  
+  static Future<void> initialize() async {
+    try {
+      await dotenv.load();
+      apiKey = dotenv.env['BINANCE_API_KEY'] ?? '';
+      apiSecret = dotenv.env['BINANCE_API_SECRET'] ?? '';
+      log.i('[AppConfig] Initialized. Testnet mode: $useTestnet');
+    } catch (e) {
+      log.w('[AppConfig] .env not found. Using empty credentials.');
+    }
+  }
+
+  // ===================================================================
+  // 2. 네트워크 엔드포인트 (테스트넷/메인넷 자동 전환)
+  // ===================================================================
+  
+  static String get restBaseUrl =>
+      useTestnet ? _testnetRestUrl : _mainnetRestUrl;
+  static String get streamUrl =>
+      useTestnet ? _testnetStreamUrl : _mainnetStreamUrl;
+
+  // 바이낸스 공식 엔드포인트
+  static const String _mainnetRestUrl = 'https://fapi.binance.com';
+  static const String _testnetRestUrl = 'https://testnet.binancefuture.com';
+  static const String _mainnetStreamUrl = 'wss://fstream.binance.com/stream';
+  static const String _testnetStreamUrl = 'wss://stream.binancefuture.com/stream';
+
+  // 추가 WebSocket 엔드포인트 옵션
+  static const String mainStreamBase = 'wss://stream.binance.com:9443';
+  static const String mainStreamAlt = 'wss://stream.binance.com:443';
+  static const String dataOnlyStream = 'wss://data-stream.binance.vision';
+
+  // ===================================================================
+  // 3. REST API 설정
+  // ===================================================================
+  
+  static const Duration restTimeout = Duration(seconds: 30);
+
+  // ===================================================================
+  // 4. 🎯 바이낸스 공식 WebSocket 제한사항 (백서 기준)
+  // ===================================================================
+  
+  /// 🚨 핵심: 클라이언트→서버 메시지 제한 (PING, PONG, JSON 컨트롤)
+  /// "WebSocket connections have a limit of 5 incoming messages per second"
+  static const int wsMaxOutgoingMsgPerSec = 5;
+  
+  /// 단일 연결당 최대 스트림 구독 개수
+  /// "A single connection can listen to a maximum of 1024 streams"
+  static const int wsMaxStreams = 1024;
+  
+  /// IP당 연결 제한
+  /// "There is a limit of 300 connections per attempt every 5 minutes per IP"
+  static const int wsMaxConnectionsPer5Min = 300;
+  
+  /// 24시간 세션 제한
+  /// "A single connection to stream.binance.com is only valid for 24 hours"
+  static const Duration wsMaxSessionDuration = Duration(hours: 24);
+
+  // ===================================================================
+  // 5. 🎯 Ping/Pong 정책 (백서 기준)
+  // ===================================================================
+  
+  /// 서버 Ping 간격
+  /// "The WebSocket server will send a ping frame every 20 seconds"
+  static const Duration wsServerPingInterval = Duration(seconds: 20);
+  
+  /// Pong 응답 타임아웃
+  /// "If the WebSocket server does not receive a pong frame back from the connection within a minute"
+  static const Duration wsPongTimeout = Duration(seconds: 60);
+  
+  /// Unsolicited Pong 간격
+  /// "Unsolicited pong frames are allowed... It is recommended that the payload for these pong frames are empty"
+  static const Duration wsUnsolicitedPongInterval = Duration(seconds: 30);
+
+  // ===================================================================
+  // 6. 🛡️ 안전 설정 (백서 기준 + 여유)
+  // ===================================================================
+  
+  /// 실제 구독할 심볼 수 (1024보다 적게 - 안전 버퍼)
+  static const int wsMaxSubscriptions = 200;
+  
+  /// 24시간 전 미리 재연결 (세션 만료 방지)
+  static const Duration wsSessionRefresh = Duration(hours: 23);
+  
+  /// 서버→클라이언트 메시지는 무제한이지만 앱 안정성을 위해 설정
+  static const int wsMaxInMsgPerSec = 2000;
+  
+  /// 컨트롤 메시지 전송 간격 (5개/초 제한 준수)
+  static const Duration wsControlMsgInterval = Duration(milliseconds: 220); // 200ms + 버퍼
+  
+  /// 재연결 시도 제한 (IP Ban 방지)
+  static const int wsMaxReconnectAttempts = 10;
+  static const Duration wsReconnectCooldown = Duration(minutes: 5);
+
+  // ===================================================================
+  // 7. 📊 스트림별 업데이트 속도 (백서 기준)
+  // ===================================================================
+  
+  static const Map<String, String> streamUpdateSpeeds = {
+    'aggTrade': 'Real-time',
+    'trade': 'Real-time',
+    'bookTicker': 'Real-time',
+    'miniTicker': '1000ms',
+    'ticker': '1000ms',
+    'depth': '1000ms',
+    'depth@100ms': '100ms',
+    'kline_1s': '1000ms',
+    'kline_others': '2000ms',
+  };
+
+  // ===================================================================
+  // 8. 🎛️ 지원되는 WebSocket 컨트롤 메서드
+  // ===================================================================
+  
+  static const List<String> wsSupportedMethods = [
+    'SUBSCRIBE',
+    'UNSUBSCRIBE',
+    'LIST_SUBSCRIPTIONS',
+    'SET_PROPERTY',
+    'GET_PROPERTY',
+  ];
+
+  // ===================================================================
+  // 9. ⚠️ 바이낸스 WebSocket 에러 코드
+  // ===================================================================
+  
+  static const Map<int, String> wsErrorCodes = {
+    0: 'Unknown property',
+    1: 'Invalid value type: expected Boolean',
+    2: 'Invalid request format',
+    3: 'Invalid JSON syntax',
+  };
+
+  // ===================================================================
+  // 10. 🔧 고급 설정
+  // ===================================================================
+  
+  /// 마이크로초 타임스탬프 사용 여부
+  static const bool useMicrosecondTimestamps = false;
+  
+  /// Combined 스트림 사용 (우리가 사용하는 방식)
+  static const bool useCombinedStreams = true;
+  
+  /// WebSocket 연결 안정성을 위한 Keep-Alive
+  static const Duration wsKeepAliveInterval = Duration(seconds: 45);
+}\n\n// ====== lib/core/network/binance_auth_interceptor.dart ======\n
+// lib/core/network/binance_auth_interceptor.dart
+
+import 'dart:convert';
+import 'package:crypto/crypto.dart';
+import 'package:dio/dio.dart';
+import '../config/app_config.dart';
+
+/// 바이낸스 API 요청에 HMAC-SHA256 시그니처를 추가하는 인터셉터
+class BinanceAuthInterceptor extends Interceptor {
+  @override
+  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    // API 키/시크릿이 필요한 private 엔드포인트에만 적용
+    if (AppConfig.apiKey.isEmpty || AppConfig.apiSecret.isEmpty) {
+      return handler.next(options);
+    }
+    
+    // Public API는 시그니처 불필요
+    if (!options.path.contains('/v1/order') && !options.path.contains('/v1/account')) {
+        options.headers['X-MBX-APIKEY'] = AppConfig.apiKey;
+        return handler.next(options);
+    }
+
+    // 타임스탬프 추가
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    options.queryParameters['timestamp'] = timestamp;
+
+    // 쿼리 파라미터를 문자열로 변환
+    final query = Uri(queryParameters: options.queryParameters).query;
+
+    // HMAC-SHA256 시그니처 생성
+    final key = utf8.encode(AppConfig.apiSecret);
+    final bytes = utf8.encode(query);
+    final hmac = Hmac(sha256, key);
+    final digest = hmac.convert(bytes);
+    
+    // 시그니처를 쿼리에 추가
+    options.queryParameters['signature'] = digest.toString();
+    options.headers['X-MBX-APIKEY'] = AppConfig.apiKey;
+
+    return handler.next(options);
+  }
+}\n\n// ====== lib/core/network/websocket/clients/kline_ws_client.dart ======\n
+\n\n// ====== lib/core/network/websocket/clients/ticker_ws_client.dart ======\n
+\n\n// ====== lib/core/network/websocket/clients/trade_ws_client.dart ======\n
+\n\n// ====== lib/core/network/websocket/clients/orderbook_ws_client.dart ======\n
+\n\n// ====== lib/core/network/websocket/trade_ws_client.dart ======\n
+import 'dart:convert';
+import 'dart:math';
+import '../../config/app_config.dart';
+import '../../../domain/entities/trade.dart';
+import '../../utils/logger.dart';
+import 'base_ws_client.dart';
+
+/// 🎯 바이낸스 선물 aggTrade 스트림 전용 클라이언트 (백서 100% 준수)
+class TradeWsClient extends BaseWsClient<Trade> {
+
+  TradeWsClient({
+    void Function(WsStatus status)? onStatusChange,
+    bool enableVerboseLogging = false,
+  }) : super(
+          url: AppConfig.streamUrl,
+          onStatusChange: onStatusChange,
+          pongTimeout: AppConfig.wsPongTimeout,
+          encodeSubscribe: (markets) => _encodeSubscribeMessage(markets),
+          // ✅ [수정] 다시 static 메서드를 전달하여 이니셜라이저 오류 해결
+          decode: (json) => _decodeTradeMessage(json, enableVerboseLogging),
+        );
+
+  // ===================================================================
+  // 📨 구독 메시지 인코딩 (바이낸스 백서 준수)
+  // ===================================================================
+
+  static String _encodeSubscribeMessage(List<String> markets) {
+    if (markets.length > AppConfig.wsMaxStreams) {
+      throw ArgumentError('Too many streams: ${markets.length}. '
+          'Binance limit: ${AppConfig.wsMaxStreams} streams per connection.');
+    }
+
+    final params =
+        markets.map((symbol) => '${symbol.toLowerCase()}@aggTrade').toList();
+    
+    // ✅ [수정] String ID를 사용하도록 변경
+    final messageId = _generateUniqueMessageId();
+
+    final subscribeMessage = {
+      'method': 'SUBSCRIBE',
+      'params': params,
+      'id': messageId,
+    };
+
+    final jsonMessage = jsonEncode(subscribeMessage);
+
+    log.i('[TradeWS] 📤 Subscribing to ${params.length} aggTrade streams');
+    log.d('[TradeWS] Subscription message: $jsonMessage');
+
+    return jsonMessage;
+  }
+
+  /// 🎯 바이낸스 호환 고유 메시지 ID 생성 (String 반환)
+  static String _generateUniqueMessageId() {
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    // 충돌 방지를 위한 랜덤 숫자 추가
+    final randomPart = Random().nextInt(99999).toString().padLeft(5, '0');
+    return '$timestamp$randomPart';
+  }
+
+  // ===================================================================
+  // 📥 메시지 디코딩 (바이낸스 Combined Stream 처리)
+  // ===================================================================
+
+  static Trade? _decodeTradeMessage(
+      Map<String, dynamic> json, bool verboseLogging) {
+    if (json.isEmpty) {
+      if (verboseLogging) log.w('[TradeWS] Empty message received');
+      return null;
+    }
+
+    if (json.containsKey('result')) {
+      if (json['result'] == null) {
+        log.i('[TradeWS] ✅ Subscription confirmed: ${json['id']}');
+      } else if (json['result'] is List) {
+        final subscriptions = json['result'] as List;
+        log.i('[TradeWS] 📋 Active subscriptions: ${subscriptions.length}');
+      }
+      return null;
+    }
+
+    if (json.containsKey('stream') && json.containsKey('data')) {
+      final streamName = json['stream'] as String?;
+      final data = json['data'];
+
+      if (streamName == null ||
+          data == null ||
+          !streamName.endsWith('@aggTrade')) {
+        return null;
+      }
+      return _parseTradeData(data, streamName, verboseLogging);
+    }
+
+    if (json.containsKey('e') && json['e'] == 'aggTrade') {
+      return _parseTradeData(json, 'direct', verboseLogging);
+    }
+
+    if (verboseLogging) {
+      log.w('[TradeWS] Unknown message type: ${json.keys.join(', ')}');
+    }
+    return null;
+  }
+
+  /// 🎯 실제 거래 데이터 파싱
+  static Trade? _parseTradeData(
+      dynamic data, String streamInfo, bool verboseLogging) {
+    try {
+      if (data is! Map<String, dynamic> || data['e'] != 'aggTrade') {
+        return null;
+      }
+
+      final trade = Trade.fromBinance(data);
+
+      // ✅ [수정] Trade 객체 속성에 의존하지 않고 원본 데이터로 로그 기록
+      if (verboseLogging) {
+        final symbol = data['s'] as String? ?? 'UNKNOWN';
+        final price = data['p'] as String? ?? '0';
+        final quantity = data['q'] as String? ?? '0';
+        log.d('[TradeWS] 💰 $symbol: $price × $quantity (Stream: $streamInfo)');
+      }
+
+      return trade;
+    } catch (e, st) {
+      log.e('[TradeWS] Trade parsing failed (Stream: $streamInfo)', e, st);
+      return null;
+    }
+  }
+
+  // ❌ [제거] 통계 관련 로직은 이 클래스의 책임을 벗어나므로 모두 제거.
+  // 이 클래스는 순수하게 데이터 스트림을 제공하는 역할만 수행.
+}\n\n// ====== lib/core/network/websocket/base_ws_client.dart ======\n
+import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import '../../config/app_config.dart';
+import '../../utils/logger.dart';
+import 'exponential_backoff.dart';
+
+enum WsStatus { connecting, connected, reconnecting, disconnected, banned }
+
+typedef DecodeFn<T> = T? Function(Map<String, dynamic> json);
+typedef EncodeFn = String Function(List<String> symbols);
+
+/// 🎯 바이낸스 공식 WebSocket 백서 100% 준수 WebSocket 클라이언트 (최종 수정본)
+class BaseWsClient<T> {
+  final String url;
+  final DecodeFn<T> decode;
+  final EncodeFn encodeSubscribe;
+  final Duration pongTimeout;
+  
+  // ✅ [수정] 외부에서 콜백을 설정할 수 있도록 final 키워드 제거
+  void Function(WsStatus status)? onStatusChange;
+  
+  // ❌ [제거] 문제를 일으키는 Unsolicited Pong 관련 속성 제거
+  // final Duration unsolicitedPongInterval;
+
+  // Core WebSocket
+  WebSocketChannel? _channel;
+  final _dataController = StreamController<T>.broadcast();
+  List<String> _subscribedSymbols = [];
+  bool _isDisposed = false;
+  WsStatus _currentStatus = WsStatus.disconnected;
+
+  // 🎯 바이낸스 백서 준수 기능들
+  final _backoff = ExponentialBackoff();
+  final _outgoingMsgTimestamps = Queue<DateTime>(); // 5개/초 제한 관리
+  final _incomingMsgTimestamps = Queue<DateTime>(); // 앱 안정성용
+
+  // 타이머들
+  Timer? _pongTimer;
+  Timer? _sessionRefreshTimer;
+  Timer? _keepAliveTimer;
+  // ❌ [제거] Unsolicited Pong 타이머 변수 제거
+  // Timer? _unsolicitedPongTimer;
+
+  // 연결 통계 (IP Ban 방지)
+  int _connectionAttempts = 0;
+  DateTime? _lastConnectionAttempt;
+  DateTime? _sessionStartTime;
+
+  BaseWsClient({
+    required this.url,
+    required this.decode,
+    required this.encodeSubscribe,
+    this.onStatusChange,
+    required this.pongTimeout,
+    // ❌ [제거]
+    // required this.unsolicitedPongInterval,
+  });
+
+  Stream<T> get stream => _dataController.stream;
+  WsStatus get currentStatus => _currentStatus;
+  bool get isConnected => _currentStatus == WsStatus.connected;
+
+  // ===================================================================
+  // 🚀 연결 관리
+  // ===================================================================
+
+  void connect(List<String> symbols) {
+    if (_isDisposed || symbols.isEmpty || _currentStatus == WsStatus.connecting) {
+      return;
+    }
+
+    if (!_canAttemptConnection()) {
+      log.w('[WS] Connection attempt blocked - too many attempts');
+      return;
+    }
+
+    _subscribedSymbols = symbols;
+    _updateStatus(WsStatus.connecting);
+    _cleanupConnection(keepSubscribers: true);
+
+    try {
+      _channel = WebSocketChannel.connect(Uri.parse(url));
+      _sessionStartTime = DateTime.now();
+      _connectionAttempts++;
+      _lastConnectionAttempt = DateTime.now();
+
+      _sendControlMessage(encodeSubscribe(_subscribedSymbols));
+
+      _channel!.stream.listen(
+        _handleMessage,
+        onDone: () => _scheduleReconnect(reason: 'Stream done'),
+        onError: (e) => _scheduleReconnect(reason: 'Stream error: $e'),
+      );
+
+      _backoff.reset();
+      _setupTimers();
+      _updateStatus(WsStatus.connected);
+      log.i('[WS] 🎯 Connected to $url (Session: ${_sessionStartTime})');
+    } catch (e, st) {
+      log.e('[WS] Connection failed', e, st);
+      _scheduleReconnect(reason: 'Connection exception');
+    }
+  }
+
+  // ===================================================================
+  // 📨 메시지 처리 (바이낸스 백서 준수)
+  // ===================================================================
+
+  void _handleMessage(dynamic message) {
+    _trackIncomingMessage();
+    _resetPongTimer();
+
+    // ✅ [수정] 메시지가 유효한 문자열인지 먼저 확인
+    if (message is! String || message.isEmpty) {
+      log.w('[WS] Received non-string or empty message, skipping. Message: $message');
+      return;
+    }
+
+    // ✅ [수정] 문서에 명시된 대로, 서버의 ping에만 pong으로 응답. 이것으로 충분.
+    if (message == 'ping' || message == 'PING') {
+      _sendPong();
+      return;
+    }
+
+    try {
+      final json = jsonDecode(message) as Map<String, dynamic>;
+
+      if (json.containsKey('code') && json['code'] != 0) {
+        final errorCode = json['code'] as int;
+        final errorMsg = json['msg'] as String? ?? 'Unknown error';
+        log.e('[WS] 🚨 Binance error: $errorMsg (code: $errorCode)');
+        
+        // ✅ [수정] code:3과 같은 서버 에러는 연결 끊김을 의미하지 않으므로, 로그만 남기고 연결 유지
+        // 심각한 오류(e.g., code:2) 시에만 재연결 고려
+        if (errorCode == 2) {
+          _scheduleReconnect(reason: 'Critical server error: $errorCode');
+        }
+        return; // 재연결하지 않고 함수 종료
+      }
+
+      final decodedData = decode(json);
+      if (decodedData != null) {
+        _dataController.add(decodedData);
+      }
+    } catch (e, st) {
+      // ✅ [수정] JSON 파싱 에러 발생 시, 연결을 끊지 않고 로그만 남김
+      log.e('[WS] Message decode error, but maintaining connection. Message: "$message"', e, st);
+    }
+  }
+
+  // ===================================================================
+  // 🎛️ 메시지 송신 (5개/초 제한 준수)
+  // ===================================================================
+
+  void _sendControlMessage(String message) {
+    if (!_canSendMessage()) {
+      log.w('[WS] 🚨 Outgoing message rate limit - message dropped');
+      return;
+    }
+    _trackOutgoingMessage();
+    _channel?.sink.add(message);
+    log.d('[WS] 📤 Control message sent');
+  }
+
+  void _sendPong() {
+    if (!_canSendMessage()) return;
+    _trackOutgoingMessage();
+    _channel?.sink.add('pong');
+    log.d('[WS] 🏓 PONG sent');
+  }
+
+  // ===================================================================
+  // 📊 속도 제한 관리 (바이낸스 백서 준수)
+  // ===================================================================
+
+  bool _canSendMessage() {
+    final now = DateTime.now();
+    _cleanOldTimestamps(_outgoingMsgTimestamps, const Duration(seconds: 1));
+    return _outgoingMsgTimestamps.length < 5; // 문서 기준 초당 5개
+  }
+
+  void _trackOutgoingMessage() {
+    _outgoingMsgTimestamps.addLast(DateTime.now());
+  }
+
+  void _trackIncomingMessage() {
+    final now = DateTime.now();
+    _incomingMsgTimestamps.addLast(now);
+    _cleanOldTimestamps(_incomingMsgTimestamps, const Duration(seconds: 1));
+
+    if (_incomingMsgTimestamps.length > AppConfig.wsMaxInMsgPerSec) {
+      log.w('[WS] ⚠️ High incoming message rate: ${_incomingMsgTimestamps.length}/sec');
+    }
+  }
+
+  void _cleanOldTimestamps(Queue<DateTime> timestamps, Duration window) {
+    final cutoff = DateTime.now().subtract(window);
+    while (timestamps.isNotEmpty && timestamps.first.isBefore(cutoff)) {
+      timestamps.removeFirst();
+    }
+  }
+
+  // ===================================================================
+  // ⏰ 타이머 관리 (바이낸스 정책 준수)
+  // ===================================================================
+
+  void _setupTimers() {
+    _resetPongTimer();
+    _setupSessionRefreshTimer();
+    _setupKeepAlive();
+    // ❌ [제거]
+    // _setupUnsolicitedPong();
+  }
+
+  void _resetPongTimer() {
+    _pongTimer?.cancel();
+    _pongTimer = Timer(pongTimeout, () {
+      log.w('[WS] 🚨 Pong timeout - no server message in ${pongTimeout.inSeconds}s');
+      _scheduleReconnect(reason: 'Pong timeout');
+    });
+  }
+
+  // ❌ [제거] Unsolicited Pong 설정 메서드 전체 제거
+  /*
+  void _setupUnsolicitedPong() { ... }
+  */
+
+  void _setupSessionRefreshTimer() {
+    _sessionRefreshTimer?.cancel();
+    _sessionRefreshTimer = Timer(AppConfig.wsSessionRefresh, () {
+      log.i('[WS] 🔄 24h session refresh - proactive reconnect');
+      _scheduleReconnect(reason: '24h session refresh');
+    });
+  }
+
+  void _setupKeepAlive() {
+    _keepAliveTimer?.cancel();
+    _keepAliveTimer = Timer.periodic(AppConfig.wsKeepAliveInterval, (_) {
+      if (_currentStatus == WsStatus.connected) {
+        log.d('[WS] 💓 Keep-alive check');
+      }
+    });
+  }
+
+  // ===================================================================
+  // 🔄 재연결 관리 (IP Ban 방지)
+  // ===================================================================
+
+  void _scheduleReconnect({required String reason}) {
+    if (_isDisposed || _currentStatus == WsStatus.reconnecting) return;
+
+    log.w('[WS] 🔄 Disconnected: $reason');
+    _updateStatus(WsStatus.reconnecting);
+    _cleanupConnection(keepSubscribers: true);
+
+    if (_connectionAttempts >= AppConfig.wsMaxReconnectAttempts) {
+      log.w('[WS] 🚨 Too many connection attempts - cooling down');
+      _updateStatus(WsStatus.banned);
+      Timer(AppConfig.wsReconnectCooldown, () {
+        _connectionAttempts = 0;
+        if (!_isDisposed) {
+          _scheduleReconnect(reason: 'Cooldown complete');
+        }
+      });
+      return;
+    }
+
+    _backoff.attempt(() async {
+      if (!_isDisposed && _subscribedSymbols.isNotEmpty) {
+        connect(_subscribedSymbols);
+      }
+    });
+  }
+
+  bool _canAttemptConnection() {
+    final now = DateTime.now();
+    if (_lastConnectionAttempt != null) {
+      final timeSinceLastAttempt = now.difference(_lastConnectionAttempt!);
+      if (timeSinceLastAttempt < const Duration(minutes: 5) &&
+          _connectionAttempts >= AppConfig.wsMaxConnectionsPer5Min) {
+        return false;
+      }
+      if (timeSinceLastAttempt >= const Duration(minutes: 5)) {
+        _connectionAttempts = 0;
+      }
+    }
+    return _connectionAttempts < AppConfig.wsMaxReconnectAttempts;
+  }
+
+  // ===================================================================
+  // 🎛️ 상태 및 정리
+  // ===================================================================
+
+  void _updateStatus(WsStatus status) {
+    if (_currentStatus == status) return;
+    final oldStatus = _currentStatus;
+    _currentStatus = status;
+    log.i('[WS] 📊 Status: $oldStatus → $status');
+    try {
+      onStatusChange?.call(status);
+    } catch (e, st) {
+      log.e('[WS] Status callback error', e, st);
+    }
+  }
+
+  void _cleanupConnection({bool keepSubscribers = false}) {
+    _pongTimer?.cancel();
+    _sessionRefreshTimer?.cancel();
+    _keepAliveTimer?.cancel();
+    // ❌ [제거]
+    // _unsolicitedPongTimer?.cancel();
+
+    try {
+      _channel?.sink.close();
+    } catch (e) {
+      log.d('[WS] Channel close error (normal): $e');
+    }
+
+    if (!keepSubscribers) {
+      _subscribedSymbols.clear();
+    }
+  }
+
+  void dispose() {
+    if (_isDisposed) return;
+    _isDisposed = true;
+    log.i('[WS] 🔌 Client disposing...');
+    _backoff.cancel();
+    _cleanupConnection();
+    _dataController.close();
+    _updateStatus(WsStatus.disconnected);
+    final sessionDuration = _sessionStartTime != null
+        ? DateTime.now().difference(_sessionStartTime!)
+        : null;
+    log.i('[WS] ✅ Disposed (Session: ${sessionDuration?.inMinutes ?? 0}min, Attempts: $_connectionAttempts)');
+  }
+
+  // ===================================================================
+  // 📊 디버그 정보
+  // ===================================================================
+
+  Map<String, dynamic> getDebugInfo() {
+    return {
+      'status': _currentStatus.toString(),
+      'subscribedSymbols': _subscribedSymbols.length,
+      'connectionAttempts': _connectionAttempts,
+      'sessionDuration': _sessionStartTime != null
+          ? DateTime.now().difference(_sessionStartTime!).inMinutes
+          : 0,
+      'outgoingMsgRate': _outgoingMsgTimestamps.length,
+      'incomingMsgRate': _incomingMsgTimestamps.length,
+    };
+  }
+}\n\n// ====== lib/core/network/websocket/exponential_backoff.dart ======\n
+import 'dart:async';
+import 'dart:math';
+import '../../utils/logger.dart';
+
+/// 🎯 바이낸스 IP Ban 방지를 위한 지수 백오프
+/// 백서 제한: "300 connections per attempt every 5 minutes per IP"
+class ExponentialBackoff {
+  final Duration initialDelay;
+  final Duration maxDelay;
+  final double randomizationFactor;
+  final int maxRetries;
+
+  int _retryCount = 0;
+  Timer? _retryTimer;
+  DateTime? _firstAttemptTime;
+
+  ExponentialBackoff({
+    this.initialDelay = const Duration(seconds: 2), // 바이낸스용 보수적 시작
+    this.maxDelay = const Duration(minutes: 5), // 5분 최대 (IP 제한 고려)
+    this.randomizationFactor = 0.3, // 30% 지터
+    this.maxRetries = 10, // IP Ban 방지
+  });
+
+  /// 🎯 다음 재시도까지의 대기 시간 계산 (바이낸스 친화적)
+  Duration get nextDelay {
+    // 첫 시도는 지연 없음
+    if (_retryCount == 0) return Duration.zero;
+
+    // 지수 백오프: 2^n * initialDelay
+    final baseDelay = initialDelay * pow(2, _retryCount - 1);
+
+    // 🎯 바이낸스 특화: 5분 경계에서 더 긴 대기
+    Duration adjustedDelay = baseDelay;
+    if (_retryCount >= 5) {
+      // 5회 이상 실패 시 더 보수적으로
+      adjustedDelay = Duration(minutes: 1 + _retryCount);
+    }
+
+    // 랜덤 지터 추가 (서버 부하 분산)
+    final random = Random();
+    final jitter = (adjustedDelay.inMilliseconds *
+            randomizationFactor *
+            (random.nextDouble() * 2 - 1))
+        .round();
+
+    final finalDelay = Duration(
+        milliseconds: (adjustedDelay.inMilliseconds + jitter)
+            .clamp(initialDelay.inMilliseconds, maxDelay.inMilliseconds));
+
+    return finalDelay;
+  }
+
+  /// 🎯 바이낸스 IP 제한 고려한 재시도 시도
+  void attempt(Future<void> Function() action) {
+    // 이전 타이머 취소
+    _retryTimer?.cancel();
+
+    // 🚨 IP Ban 방지: 최대 재시도 체크
+    if (_retryCount >= maxRetries) {
+      log.e(
+          '[Backoff] 🚨 Max retry limit reached ($maxRetries). Stopping to prevent IP ban.');
+      _resetForCooldown();
+      return;
+    }
+
+    // 🎯 5분 경계 체크 (바이낸스 정책)
+    if (_shouldCooldown()) {
+      log.w('[Backoff] 🕐 5-minute cooldown activated for IP safety');
+      _resetForCooldown();
+      return;
+    }
+
+    _retryCount++;
+    _firstAttemptTime ??= DateTime.now();
+
+    final delay = nextDelay;
+    final totalDuration = DateTime.now().difference(_firstAttemptTime!);
+
+    log.i('[Backoff] 🔄 Attempt #$_retryCount after ${delay.inSeconds}s '
+        '(Total: ${totalDuration.inMinutes}min)');
+
+    _retryTimer = Timer(delay, () async {
+      try {
+        await action();
+        // 성공 시 리셋은 외부에서 호출 (connect 성공 시)
+      } catch (e) {
+        log.w('[Backoff] ❌ Action failed: $e');
+        // 실패 시 다시 재시도하지 않음 (호출자가 결정)
+      }
+    });
+  }
+
+  /// 🎯 바이낸스 5분 제한 고려 (300 connections per 5 minutes)
+  bool _shouldCooldown() {
+    if (_firstAttemptTime == null) return false;
+
+    final elapsed = DateTime.now().difference(_firstAttemptTime!);
+
+    // 5분 내에 너무 많은 시도
+    if (elapsed < const Duration(minutes: 5) && _retryCount >= 8) {
+      return true;
+    }
+
+    // 총 시도 시간이 너무 길면 (15분 이상)
+    if (elapsed > const Duration(minutes: 15)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /// 5분 쿨다운 후 재시작
+  void _resetForCooldown() {
+    const cooldownDuration = Duration(minutes: 5);
+    log.i('[Backoff] 🕐 Starting ${cooldownDuration.inMinutes}min cooldown...');
+
+    _retryTimer?.cancel();
+    _retryTimer = Timer(cooldownDuration, () {
+      log.i('[Backoff] ✅ Cooldown complete - resetting counters');
+      reset();
+    });
+  }
+
+  /// 연결 성공 시 백오프 리셋
+  void reset() {
+    _retryCount = 0;
+    _firstAttemptTime = null;
+    _retryTimer?.cancel();
+    log.d('[Backoff] ✅ Reset - ready for new attempts');
+  }
+
+  /// 백오프 완전 중지
+  void cancel() {
+    _retryTimer?.cancel();
+    _retryCount = 0;
+    _firstAttemptTime = null;
+    log.d('[Backoff] 🛑 Cancelled');
+  }
+
+  // ===================================================================
+  // 📊 상태 정보
+  // ===================================================================
+
+  int get retryCount => _retryCount;
+  bool get isActive => _retryTimer?.isActive ?? false;
+  bool get isInCooldown => _retryCount == 0 && isActive;
+
+  Duration? get timeSinceFirstAttempt => _firstAttemptTime != null
+      ? DateTime.now().difference(_firstAttemptTime!)
+      : null;
+
+  /// 백오프 상태 디버그 정보
+  Map<String, dynamic> getDebugInfo() {
+    return {
+      'retryCount': _retryCount,
+      'isActive': isActive,
+      'isInCooldown': isInCooldown,
+      'nextDelaySeconds': nextDelay.inSeconds,
+      'timeSinceFirstAttemptMinutes': timeSinceFirstAttempt?.inMinutes ?? 0,
+      'maxRetries': maxRetries,
+      'shouldCooldown': _shouldCooldown(),
+    };
+  }
+
+  /// 백오프 전략 설명
+  String getStrategyDescription() {
+    final buf = StringBuffer();
+    buf.writeln('🎯 Binance IP Ban Prevention Strategy:');
+    buf.writeln('  • Initial delay: ${initialDelay.inSeconds}s');
+    buf.writeln('  • Max delay: ${maxDelay.inMinutes}min');
+    buf.writeln('  • Max retries: $maxRetries');
+    buf.writeln('  • Jitter factor: ${(randomizationFactor * 100).toInt()}%');
+    buf.writeln(
+        '  • 5-minute cooldown: ${_retryCount >= 8 ? "ACTIVE" : "Ready"}');
+    return buf.toString();
+  }
+
+  /// 현재 백오프 상태 요약
+  String getStatusSummary() {
+    if (_retryCount == 0) return '✅ Ready';
+    if (isInCooldown) return '🕐 Cooling down';
+    if (_retryCount >= maxRetries) return '🚨 Max retries reached';
+    return '🔄 Retrying (#$_retryCount/${maxRetries})';
+  }
+}
+\n\n// ====== lib/core/network/websocket/binance_ws_utils.dart ======\n
+import 'dart:convert';
+import 'dart:math';
+import '../../config/app_config.dart';
+import '../../utils/logger.dart';
+
+/// 🎯 바이낸스 WebSocket 공통 유틸리티 클래스
+class BinanceWsUtils {
+  
+  // ===================================================================
+  // 📨 메시지 생성
+  // ===================================================================
+
+  /// 고유한 메시지 ID 생성 (바이낸스 호환)
+  static int generateMessageId() {
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final random = Random().nextInt(1000);
+    return timestamp * 1000 + random;
+  }
+
+  /// 바이낸스 구독 메시지 생성
+  static String createSubscribeMessage(List<String> params) {
+    if (params.length > AppConfig.wsMaxStreams) {
+      throw ArgumentError(
+        'Too many streams: ${params.length}. '
+        'Binance limit: ${AppConfig.wsMaxStreams} streams per connection.'
+      );
+    }
+
+    final subscribeMessage = {
+      'method': 'SUBSCRIBE',
+      'params': params,
+      'id': generateMessageId(),
+    };
+
+    final jsonMessage = jsonEncode(subscribeMessage);
+    log.d('[BinanceWS] 📤 Subscribe message: $jsonMessage');
+    
+    return jsonMessage;
+  }
+
+  /// 바이낸스 구독 해제 메시지 생성
+  static String createUnsubscribeMessage(List<String> params) {
+    final unsubscribeMessage = {
+      'method': 'UNSUBSCRIBE',
+      'params': params,
+      'id': generateMessageId(),
+    };
+
+    final jsonMessage = jsonEncode(unsubscribeMessage);
+    log.d('[BinanceWS] 📤 Unsubscribe message: $jsonMessage');
+    
+    return jsonMessage;
+  }
+
+  // ===================================================================
+  // 📥 메시지 검증
+  // ===================================================================
+
+  /// Combined Stream 데이터 추출
+  static Map<String, dynamic>? extractCombinedStreamData(
+    Map<String, dynamic> json,
+    String expectedStreamSuffix,
+  ) {
+    if (!json.containsKey('stream') || !json.containsKey('data')) {
+      return null;
+    }
+
+    final streamName = json['stream'] as String?;
+    final data = json['data'];
+
+    if (streamName == null || data == null) {
+      return null;
+    }
+
+    // 스트림 타입 확인
+    if (!streamName.contains(expectedStreamSuffix)) {
+      return null;
+    }
+
+    if (data is Map<String, dynamic>) {
+      return data;
+    }
+
+    return null;
+  }
+
+  /// Direct Stream 데이터 확인
+  static bool isDirectStreamEvent(Map<String, dynamic> json, String eventType) {
+    return json.containsKey('e') && json['e'] == eventType;
+  }
+
+  // ===================================================================
+  // 📊 통계 유틸리티
+  // ===================================================================
+
+  /// 기본 통계 정보 생성
+  static Map<String, dynamic> createBaseStatistics({
+    required String streamType,
+    required String updateSpeed,
+    required int totalReceived,
+    required int totalErrors,
+    required int activeStreams,
+    required DateTime? firstTime,
+    required DateTime? lastTime,
+    Map<String, dynamic>? additionalStats,
+  }) {
+    final now = DateTime.now();
+    final sessionDuration = firstTime != null
+        ? now.difference(firstTime)
+        : Duration.zero;
+
+    final itemsPerMinute = sessionDuration.inMinutes > 0
+        ? (totalReceived / sessionDuration.inMinutes).toStringAsFixed(1)
+        : '0';
+
+    final errorRate = totalReceived > 0
+        ? '${((totalErrors / (totalReceived + totalErrors)) * 100).toStringAsFixed(2)}%'
+        : '0%';
+
+    final baseStats = {
+      'streamType': streamType,
+      'updateSpeed': updateSpeed,
+      'totalReceived': totalReceived,
+      'totalErrors': totalErrors,
+      'activeStreams': activeStreams,
+      'sessionDurationMinutes': sessionDuration.inMinutes,
+      'itemsPerMinute': itemsPerMinute,
+      'errorRate': errorRate,
+      'firstTime': firstTime?.toIso8601String(),
+      'lastTime': lastTime?.toIso8601String(),
+    };
+
+    if (additionalStats != null) {
+      baseStats.addAll(additionalStats);
+    }
+
+    return baseStats;
+  }
+
+  // ===================================================================
+  // 🔧 스트림 파라미터 생성기
+  // ===================================================================
+
+  /// aggTrade 스트림 파라미터 생성
+  static List<String> createAggTradeStreams(List<String> symbols) {
+    return symbols.map((symbol) => '${symbol.toLowerCase()}@aggTrade').toList();
+  }
+
+  /// depth 스트림 파라미터 생성
+  static List<String> createDepthStreams(List<String> symbols, {bool fast = false}) {
+    final suffix = fast ? 'depth@100ms' : 'depth';
+    return symbols.map((symbol) => '${symbol.toLowerCase()}@$suffix').toList();
+  }
+
+  /// bookTicker 스트림 파라미터 생성
+  static List<String> createBookTickerStreams(List<String> symbols) {
+    return symbols.map((symbol) => '${symbol.toLowerCase()}@bookTicker').toList();
+  }
+
+  /// kline 스트림 파라미터 생성
+  static List<String> createKlineStreams(List<String> symbols, String interval) {
+    return symbols.map((symbol) => '${symbol.toLowerCase()}@kline_$interval').toList();
+  }
+
+  /// ticker 스트림 파라미터 생성
+  static List<String> createTickerStreams(List<String> symbols, {bool mini = false}) {
+    final suffix = mini ? 'miniTicker' : 'ticker';
+    return symbols.map((symbol) => '${symbol.toLowerCase()}@$suffix').toList();
+  }
+
+  /// 전체 ticker 스트림 파라미터 생성 (모든 심볼)
+  static List<String> createAllTickerStreams({bool mini = false}) {
+    final suffix = mini ? '!miniTicker@arr' : '!ticker@arr';
+    return [suffix];
+  }
+}\n\n// ====== lib/core/network/api_client.dart ======\n
+import 'package:dio/dio.dart';
+import '../config/app_config.dart';
+import '../error/app_exception.dart';
+import '../utils/logger.dart';
+
+/// 바이낸스 선물 REST API 통신을 위한 클라이언트
+class ApiClient {
+  final Dio _dio;
+
+  ApiClient({Dio? dio})
+      : _dio = dio ??
+            Dio(BaseOptions(
+              baseUrl: AppConfig.restBaseUrl,
+              connectTimeout: AppConfig.restTimeout,
+              receiveTimeout: AppConfig.restTimeout,
+            ));
+
+  /// GET 요청을 위한 범용 메서드
+  Future<dynamic> get(String path) async {
+    try {
+      log.d('[API] GET: $path');
+      final response = await _dio.get(path);
+      return response.data;
+    } on DioException catch (e, st) {
+      // ✅ 에러 로깅 방식을 positional argument로 수정
+      log.e('[API] GET failed on path: $path', e, st);
+      // DioException을 커스텀 NetworkException으로 변환하여 반환
+      throw NetworkException.fromDio(e);
+    } catch (e, st) {
+      // ✅ 에러 로깅 방식을 positional argument로 수정
+      log.e('[API] Unexpected error on path: $path', e, st);
+      // 그 외 예외는 일반 AppException으로 처리
+      throw AppException(e.toString());
+    }
+  }
+}\n\n// ====== lib/core/utils/logger.dart ======\n
+import 'package:logger/logger.dart';
+
+/// 앱 전체에서 사용할 전역 로거 인스턴스
+final Logger log = Logger(
+  printer: PrettyPrinter(
+    methodCount: 1, // 로그 호출 스택을 한 줄만 표시
+    errorMethodCount: 8, // 에러 발생 시 표시할 스택 트레이스 라인 수
+    lineLength: 120, // 로그 한 줄의 최대 길이
+    colors: true, // 로그 레벨별 컬러 적용
+    printEmojis: true, // 로그 레벨별 이모지 적용
+    printTime: true, // 타임스탬프 출력
+  ),
+  // 개발 중에는 모든 레벨의 로그를, 릴리즈 시에는 Level.warning 등으로 변경 가능
+  level: Level.debug,
+);
+\n\n// ====== lib/core/common/time_frame_types.dart ======\n
+import 'package:flutter/foundation.dart';
+
+/// 거래 필터 Enum (단위: USDT)
+///
+/// 바이낸스 환경에 맞춰 거래대금 필터의 기준을 USDT로 변경합니다.
+enum TradeFilter {
+  usdt10k(10000, '10K USDT'),
+  usdt30k(30000, '30K USDT'),
+  usdt50k(50000, '50K USDT'),
+  usdt100k(100000, '100K USDT'),
+  usdt300k(300000, '300K USDT'),
+  usdt500k(500000, '500K USDT');
+
+  const TradeFilter(this.value, this.displayName);
+  final double value;
+  final String displayName;
+
+  static List<TradeFilter> get supportedFilters => values.toList();
+}
+
+/// 거래 모드 Enum (거래소 무관)
+enum TradeMode {
+  accumulated('누적'),
+  range('구간');
+
+  const TradeMode(this.displayName);
+  final String displayName;
+
+  bool get isAccumulated => this == TradeMode.accumulated;
+}
+
+/// 거래 관련 설정 (거래소 무관)
+class TradeConfig {
+  /// 필터별로 UI에 표시할 최대 거래 내역 개수
+  static const int maxTradesPerFilter = 200;
+  
+  /// 중복 체결 ID를 걸러내기 위한 캐시 사이즈
+  static const int maxSeenIdsCacheSize = 1000;
+}
+
+/// 바이낸스 마켓 정보 엔티티
+///
+/// 바이낸스의 `/fapi/v1/exchangeInfo` 엔드포인트 응답을 기반으로 재구성합니다.
+@immutable
+class MarketInfo {
+  final String symbol;
+  final String pair;
+  final String status;
+  final String baseAsset;
+  final String quoteAsset;
+  final int pricePrecision;
+  final int quantityPrecision;
+
+  const MarketInfo({
+    required this.symbol,
+    required this.pair,
+    required this.status,
+    required this.baseAsset,
+    required this.quoteAsset,
+    required this.pricePrecision,
+    required this.quantityPrecision,
+  });
+
+  factory MarketInfo.fromJson(Map<String, dynamic> json) {
+    return MarketInfo(
+      symbol: json['symbol'] ?? '',
+      pair: json['pair'] ?? '',
+      status: json['status'] ?? '',
+      baseAsset: json['baseAsset'] ?? '',
+      quoteAsset: json['quoteAsset'] ?? '',
+      pricePrecision: json['pricePrecision'] ?? 0,
+      quantityPrecision: json['quantityPrecision'] ?? 0,
+    );
+  }
+}\n\n// ====== lib/core/error/app_exception.dart ======\n
+import 'package:dio/dio.dart';
+
+/// 앱의 최상위 커스텀 예외 클래스
+class AppException implements Exception {
+  final String message;
+  final StackTrace? stackTrace;
+
+  const AppException(this.message, [this.stackTrace]);
+
+  @override
+  String toString() => 'AppException: $message';
+}
+
+/// 네트워크(REST API) 관련 예외
+class NetworkException extends AppException {
+  final DioException? originalException;
+
+  const NetworkException(String message, {this.originalException, StackTrace? stackTrace})
+      : super(message, stackTrace);
+
+  factory NetworkException.fromDio(DioException dioError) {
+    final message = dioError.message ?? 'A network error occurred.';
+    return NetworkException(
+      message,
+      originalException: dioError,
+      stackTrace: dioError.stackTrace,
+    );
+  }
+
+  @override
+  String toString() => 'NetworkException: $message';
+}
+
+/// WebSocket 관련 예외
+class WebSocketException extends AppException {
+  const WebSocketException(String message, [StackTrace? stackTrace])
+      : super(message, stackTrace);
+      
+  @override
+  String toString() => 'WebSocketException: $message';
+}
+
+/// 데이터 파싱(JSON 등) 관련 예외
+class DataParsingException extends AppException {
+  const DataParsingException(String message, [StackTrace? stackTrace])
+      : super(message, stackTrace);
+
+  @override
+  String toString() => 'DataParsingException: $message';
+}\n\n// ====== lib/main.dart ======\n
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'presentation/pages/main_page.dart';
+
+void main() {
+  runApp(const ProviderScope(child: MyApp()));
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Binance Pro',
+      theme: ThemeData.light(),
+      darkTheme: ThemeData.dark(),
+      themeMode: ThemeMode.system,
+      debugShowCheckedModeBanner: false,
+      home: const MainPage(),
+    );
+  }
+}\n\n// ====== lib/data/datasources/trade_remote_ds.dart ======\n
+// lib/data/datasources/trade_remote_ds.dart
+
+import '../../core/network/websocket/trade_ws_client.dart';
+import '../../domain/entities/trade.dart';
+
+/// 원격 WebSocket으로부터 실시간 Trade 데이터를 수신하는 데이터 소스
+class TradeRemoteDataSource {
+  final TradeWsClient _wsClient;
+
+  TradeRemoteDataSource(this._wsClient);
+
+  /// WebSocket 클라이언트에 마켓 구독을 요청하고,
+  /// 반환되는 순수 Trade 스트림을 그대로 전달합니다.
+  Stream<Trade> watchTrades(List<String> markets) {
+    _wsClient.connect(markets);
+    return _wsClient.stream;
+  }
+}\n\n// ====== lib/data/repositories/volume_repository_impl.dart ======\n
+// lib/data/repositories/volume_repository_impl.dart
+
+import 'dart:async';
+import 'package:collection/collection.dart'; // sorted를 위해 import 추가
+import '../../core/utils/logger.dart';
+import '../../domain/entities/trade.dart';
+import '../../domain/entities/volume.dart';
+import '../../domain/repositories/volume_repository.dart';
+import '../datasources/trade_remote_ds.dart';
+
+class VolumeRepositoryImpl implements VolumeRepository {
+  final TradeRemoteDataSource _remoteDataSource;
+
+  final Map<TimeFrame, StreamController<List<Volume>>> _controllers = {};
+  StreamSubscription? _rawTradeSub;
+  final Map<TimeFrame, Map<String, double>> _volumeCache = {};
+  final Map<TimeFrame, DateTime> _timeFrameStartTimes = {};
+  Timer? _batchUpdateTimer;
+  Timer? _resetCheckTimer;
+  bool _isInitialized = false;
+
+  VolumeRepositoryImpl(this._remoteDataSource) {
+    for (final tf in TimeFrame.values) {
+      _controllers[tf] = StreamController<List<Volume>>.broadcast();
+      _volumeCache[tf] = {};
+      _timeFrameStartTimes[tf] = DateTime.now();
+    }
+    _resetCheckTimer = Timer.periodic(const Duration(seconds: 15), (_) => _checkTimeFrameResets());
+  }
+
+  void _initialize(List<String> markets) {
+    if (_isInitialized) return;
+    _isInitialized = true;
+    final rawTradeStream = _remoteDataSource.watchTrades(markets);
+    _rawTradeSub = rawTradeStream.listen(_processTrade);
+    log.i('[VolumeRepo] Initialized.');
+  }
+
+  void _processTrade(Trade trade) {
+    for (final tf in TimeFrame.values) {
+      final cache = _volumeCache[tf]!;
+      cache[trade.market] = (cache[trade.market] ?? 0) + trade.totalValue;
+    }
+    _scheduleBatchUpdate();
+  }
+
+  void _scheduleBatchUpdate() {
+    _batchUpdateTimer?.cancel();
+    _batchUpdateTimer = Timer(const Duration(milliseconds: 100), _performBatchUpdate);
+  }
+
+  void _performBatchUpdate() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    for (final tf in TimeFrame.values) {
+      final cache = _volumeCache[tf]!;
+      final startTime = _timeFrameStartTimes[tf]!;
+      
+      final volumeList = cache.entries.map((entry) => Volume(
+            market: entry.key,
+            totalValue: entry.value,
+            lastUpdated: now,
+            timeFrame: tf,
+            timeFrameStart: startTime.millisecondsSinceEpoch,
+          ))
+      // ✅ sortedBy -> sorted로 변경하고, null 안정성 처리
+      .sorted((a, b) => b.totalValue.compareTo(a.totalValue));
+      
+      _controllers[tf]?.add(volumeList);
+    }
+  }
+
+  void _checkTimeFrameResets() {
+    final now = DateTime.now();
+    for (final tf in TimeFrame.values) {
+      final startTime = _timeFrameStartTimes[tf]!;
+      if (now.difference(startTime) >= tf.duration) {
+        _resetTimeFrame(tf, now);
+      }
+    }
+  }
+
+  void _resetTimeFrame(TimeFrame timeFrame, DateTime newStartTime) {
+    _volumeCache[timeFrame]?.clear();
+    _timeFrameStartTimes[timeFrame] = newStartTime;
+    _performBatchUpdate();
+  }
+
+  @override
+  Stream<List<Volume>> watchVolumeRanking(TimeFrame timeFrame, List<String> markets) {
+    _initialize(markets);
+    Future.microtask(_performBatchUpdate);
+    return _controllers[timeFrame]?.stream ?? const Stream.empty();
+  }
+
+  @override
+  void resetTimeFrame(TimeFrame timeFrame) {
+    _resetTimeFrame(timeFrame, DateTime.now());
+  }
+
+  @override
+  void resetAllTimeFrames() {
+    final now = DateTime.now();
+    for (final tf in TimeFrame.values) {
+      _resetTimeFrame(tf, now);
+    }
+  }
+
+  @override
+  void dispose() {
+    _rawTradeSub?.cancel();
+    _batchUpdateTimer?.cancel();
+    _resetCheckTimer?.cancel();
+    for (var controller in _controllers.values) {
+      controller.close();
+    }
+    log.i('[VolumeRepo] Disposed.');
+  }
+}\n\n// ====== lib/data/repositories/trade_repository_impl.dart ======\n
+// lib/data/repositories/trade_repository_impl.dart
+
+import 'dart:async';
+import 'dart:collection';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../core/common/time_frame_types.dart';
+import '../../domain/entities/trade.dart';
+import '../../domain/repositories/trade_repository.dart';
+import '../datasources/trade_remote_ds.dart';
+import '../processors/trade_aggregator.dart';
+import '../../core/utils/logger.dart';
+
+class TradeRepositoryImpl implements TradeRepository {
+  final TradeRemoteDataSource _remoteDataSource;
+  final TradeAggregator _aggregator;
+  
+  // 데이터 스트림 컨트롤러
+  final _filteredTradesController = StreamController<List<Trade>>.broadcast();
+  
+  // 내부 상태
+  StreamSubscription? _rawTradeSub;
+  StreamSubscription? _aggregatedTradeSub;
+  double _currentThreshold = TradeFilter.usdt50k.value; // 기본 임계값
+  final Map<TradeFilter, List<Trade>> _filterCache = {
+    for (var filter in TradeFilter.values) filter: []
+  };
+  final _seenIds = LinkedHashSet<String>();
+  Timer? _batchUpdateTimer;
+  bool _isInitialized = false;
+
+  TradeRepositoryImpl(this._remoteDataSource) : _aggregator = TradeAggregator();
+
+  void _initialize(List<String> markets) {
+    if (_isInitialized) return;
+    _isInitialized = true;
+
+    // 1. 원격 데이터 소스의 스트림을 구독
+    final rawTradeStream = _remoteDataSource.watchTrades(markets);
+    _rawTradeSub = rawTradeStream.listen(_processRawTrade);
+
+    // 2. 집계기(Aggregator)의 스트림을 구독
+    _aggregatedTradeSub = _aggregator.stream.listen(_handleAggregatedTrade);
+    
+    log.i('[Repository] Initialized with ${markets.length} markets.');
+  }
+
+  /// 1. 원시 데이터 처리: 중복 확인 후 집계기로 전달
+  void _processRawTrade(Trade trade) {
+    if (!_seenIds.add(trade.tradeId)) return;
+    if (_seenIds.length > TradeConfig.maxSeenIdsCacheSize) {
+      _seenIds.remove(_seenIds.first);
+    }
+    _aggregator.process(trade);
+  }
+
+  /// 2. 집계된 데이터 처리: 필터별 캐시에 저장
+  void _handleAggregatedTrade(Trade trade) {
+    for (final filter in TradeFilter.values) {
+      if (trade.totalValue >= filter.value) {
+        final list = _filterCache[filter]!;
+        list.insert(0, trade);
+        if (list.length > TradeConfig.maxTradesPerFilter) {
+          list.removeLast();
+        }
+      }
+    }
+    // UI 업데이트는 바로 하지 않고, 배치 스케줄링
+    _scheduleBatchUpdate();
+  }
+  
+  /// 3. 배치 업데이트 스케줄링: 100ms 이내의 변경사항은 한 번에 모아서 UI 업데이트
+  void _scheduleBatchUpdate() {
+    _batchUpdateTimer?.cancel();
+    _batchUpdateTimer = Timer(const Duration(milliseconds: 100), _performBatchUpdate);
+  }
+  
+  /// 4. 실제 UI 업데이트 수행: 현재 임계값에 맞는 최종 리스트를 스트림에 전달
+  void _performBatchUpdate() {
+    final list = _filterCache[
+      TradeFilter.values.firstWhere(
+        (f) => f.value == _currentThreshold,
+        orElse: () => TradeFilter.usdt50k,
+      )
+    ] ?? [];
+    
+    _filteredTradesController.add(List.from(list));
+  }
+
+  @override
+  Stream<List<Trade>> watchFilteredTrades(List<String> markets) {
+    _initialize(markets);
+    return _filteredTradesController.stream;
+  }
+
+  @override
+  Stream<Trade> watchAggregatedTrades(List<String> markets) {
+    _initialize(markets);
+    return _aggregator.stream;
+  }
+  
+  @override
+  void updateThreshold(double threshold) {
+    if (_currentThreshold == threshold) return;
+    _currentThreshold = threshold;
+    log.d('[Repository] Threshold updated to: $threshold');
+    // 임계값 변경 시 즉시 UI 업데이트 수행
+    _performBatchUpdate();
+  }
+
+  @override
+  void dispose() {
+    _rawTradeSub?.cancel();
+    _aggregatedTradeSub?.cancel();
+    _batchUpdateTimer?.cancel();
+    _aggregator.dispose();
+    _filteredTradesController.close();
+    _isInitialized = false;
+    log.i('[Repository] Disposed.');
+  }
+}\n\n// ====== lib/data/processors/trade_aggregator.dart ======\n
+// lib/data/processors/trade_aggregator.dart
+
+import 'dart:async';
+import '../../domain/entities/trade.dart';
+import '../../core/utils/logger.dart';
+
+/// 실시간 거래를 병합하여 UI 업데이트 빈도를 조절하는 거래 집계기
+class TradeAggregator {
+  final Map<String, Trade> _pendingTrades = {};
+  final _controller = StreamController<Trade>.broadcast();
+  Timer? _flushTimer;
+
+  /// 집계 처리된 거래 데이터 스트림
+  Stream<Trade> get stream => _controller.stream;
+
+  TradeAggregator() {
+    // 1초마다 대기 중인 거래들을 방출(flush)하여 항상 최신 데이터가 반영되도록 함
+    _flushTimer = Timer.periodic(const Duration(seconds: 1), (_) => _flush());
+  }
+
+  /// 새로운 거래를 받아 집계 로직 처리
+  void process(Trade trade) {
+    final existing = _pendingTrades[trade.market];
+
+    // 해당 마켓에 대기 중인 거래가 없다면 새로 추가
+    if (existing == null) {
+      _pendingTrades[trade.market] = trade;
+      return;
+    }
+
+    // 시간 창(500ms) 내의 거래라면 병합
+    if (trade.timestamp - existing.timestamp <= 500) {
+      final newQuantity = existing.quantity + trade.quantity;
+      _pendingTrades[trade.market] = Trade(
+        market: trade.market,
+        price: trade.price, // 가격은 최신 거래의 것을 따름
+        quantity: newQuantity,
+        totalValue: existing.totalValue + trade.totalValue,
+        isBuy: trade.isBuy, // 방향도 최신 거래의 것을 따름
+        timestamp: trade.timestamp,
+        tradeId: trade.tradeId,
+      );
+    } else {
+      // 시간 창을 벗어나면, 기존 거래는 방출하고 새 거래를 대기
+      _controller.add(existing);
+      _pendingTrades[trade.market] = trade;
+    }
+  }
+
+  /// 대기 중인 모든 거래를 방출
+  void _flush() {
+    if (_pendingTrades.isEmpty) return;
+    _pendingTrades.values.forEach(_controller.add);
+    _pendingTrades.clear();
+  }
+
+  void dispose() {
+    _flushTimer?.cancel();
+    _controller.close();
+    log.i('[Aggregator] Disposed.');
+  }
+}\n\n// ====== lib/data/processors/volume_processor.dart ======\n
+\n\n// ====== lib/domain/repositories/trade_repository.dart ======\n
+// lib/domain/repositories/trade_repository.dart
+
+import '../entities/trade.dart';
+
+abstract class TradeRepository {
+  /// 필터링된 실시간 체결 리스트 스트림
+  Stream<List<Trade>> watchFilteredTrades(List<String> markets);
+
+  /// 집계 처리된 단일 체결 스트림
+  Stream<Trade> watchAggregatedTrades(List<String> markets);
+
+  /// 실시간으로 필터 임계값 업데이트
+  void updateThreshold(double threshold);
+  
+  /// 리소스 정리
+  void dispose();
+}\n\n// ====== lib/domain/repositories/volume_repository.dart ======\n
+import '../entities/trade.dart';
+import '../entities/volume.dart';
+
+/// 시간대별 거래량 데이터의 집계 및 제공을 담당하는 Repository 인터페이스
+abstract class VolumeRepository {
+  /// 지정된 시간대의 거래량 순위 스트림을 제공합니다.
+  Stream<List<Volume>> watchVolumeRanking(TimeFrame timeFrame, List<String> markets);
+
+  /// 특정 시간대의 누적 거래량을 수동으로 리셋합니다.
+  void resetTimeFrame(TimeFrame timeFrame);
+
+  /// 모든 시간대의 누적 거래량을 수동으로 리셋합니다.
+  void resetAllTimeFrames();
+
+  /// 리소스를 정리합니다.
+  void dispose();
+}\n\n// ====== lib/domain/usecases/volume_usecase.dart ======\n
+// lib/domain/usecases/volume_usecase.dart
+
+import '../entities/volume.dart';
+import '../repositories/volume_repository.dart';
+
+class VolumeUsecase {
+  final VolumeRepository _repository;
+
+  VolumeUsecase(this._repository);
+
+  Stream<List<Volume>> watchVolumeRanking(TimeFrame timeFrame, List<String> markets) {
+    return _repository.watchVolumeRanking(timeFrame, markets);
+  }
+
+  void resetTimeFrame(TimeFrame timeFrame) {
+    _repository.resetTimeFrame(timeFrame);
+  }
+
+  void resetAllTimeFrames() {
+    _repository.resetAllTimeFrames();
+  }
+
+  void dispose() {
+    _repository.dispose();
+  }
+}\n\n// ====== lib/domain/usecases/trade_usecase.dart ======\n
+// lib/domain/usecases/trade_usecase.dart
+
+import '../entities/trade.dart';
+import '../repositories/trade_repository.dart';
+
+class TradeUsecase {
+  final TradeRepository _repository;
+
+  TradeUsecase(this._repository);
+
+  Stream<List<Trade>> watchFilteredTrades(List<String> markets) {
+    return _repository.watchFilteredTrades(markets);
+  }
+
+  Stream<Trade> watchAggregatedTrades(List<String> markets) {
+    return _repository.watchAggregatedTrades(markets);
+  }
+  
+  void updateThreshold(double threshold) {
+    _repository.updateThreshold(threshold);
+  }
+  
+  void dispose() {
+    _repository.dispose();
+  }
+}\n\n// ====== lib/domain/entities/trade.dart ======\n
+import 'package:equatable/equatable.dart';
+
+class Trade extends Equatable {
+  /// 심볼 (e.g., BTCUSDT)
+  final String market;
+
+  /// 체결 가격
+  final double price;
+
+  /// 체결 수량 (API 필드명 'q'에 맞춰 volume -> quantity로 변경)
+  final double quantity;
+
+  /// 총 체결액 (price * quantity)
+  final double totalValue; // total -> totalValue로 명확화
+
+  /// 매수 체결 여부
+  final bool isBuy;
+
+  /// 체결 시각 (milliseconds from epoch)
+  final int timestamp; // timestampMs -> timestamp로 간소화
+
+  /// 거래 고유 ID (Aggregate trade ID)
+  final String tradeId; // id -> tradeId로 명확화
+
+  const Trade({
+    required this.market,
+    required this.price,
+    required this.quantity,
+    required this.totalValue,
+    required this.isBuy,
+    required this.timestamp,
+    required this.tradeId,
+  });
+
+  /// UI에서 사용하기 편한 DateTime 객체
+  DateTime get dateTime => DateTime.fromMillisecondsSinceEpoch(timestamp);
+
+  /// 바이낸스 선물 `aggTrade` 스트림 데이터로부터 Trade 객체 생성
+  factory Trade.fromBinance(Map<String, dynamic> json) {
+    final price = double.parse(json['p'].toString());
+    final quantity = double.parse(json['q'].toString());
+
+    return Trade(
+      market: json['s'] as String,
+      price: price,
+      quantity: quantity,
+      totalValue: price * quantity,
+      isBuy: !(json['m'] as bool), // isBuyerMaker(`m`)가 false일 때가 매수
+      timestamp: json['T'] as int,
+      tradeId: json['a'].toString(),
+    );
+  }
+
+  /// Equatable을 위한 설정. tradeId를 기준으로 객체의 동등성을 비교합니다.
+  @override
+  List<Object> get props => [tradeId];
+}\n\n// ====== lib/domain/entities/volume.dart ======\n
+import 'package:equatable/equatable.dart';
+
+/// 거래량 데이터를 집계할 시간대(TimeFrame)를 정의하는 Enum
+enum TimeFrame {
+  min1(1, '1m'),
+  min3(3, '3m'),
+  min5(5, '5m'),
+  min15(15, '15m'),
+  min30(30, '30m'),
+  hour1(60, '1h'),
+  hour2(120, '2h'),
+  hour4(240, '4h'),
+  hour6(360, '6h'),
+  hour12(720, '12h'),
+  day1(1440, '1d'),
+  week1(10080, '1w');
+
+  const TimeFrame(this.minutes, this.displayName);
+  final int minutes;
+  final String displayName;
+
+  Duration get duration => Duration(minutes: minutes);
+}
+
+
+/// 마켓별, 시간대별 누적 거래량 정보를 담는 데이터 모델
+class Volume extends Equatable {
+  /// 마켓 심볼 (e.g., "BTCUSDT")
+  final String market;
+  
+  /// 해당 시간대 누적 거래대금 (단위: USDT)
+  final double totalValue;
+  
+  /// 마지막 업데이트 시각 (milliseconds from epoch)
+  final int lastUpdated;
+  
+  /// 데이터 집계 기준 시간대
+  final TimeFrame timeFrame;
+  
+  /// 현재 시간대(봉)가 시작된 시각 (milliseconds from epoch)
+  final int timeFrameStart;
+
+  const Volume({
+    required this.market,
+    required this.totalValue,
+    required this.lastUpdated,
+    required this.timeFrame,
+    required this.timeFrameStart,
+  });
+  
+  /// 코인 티커만 추출 (e.g., "BTCUSDT" -> "BTC")
+  String get ticker => market.replaceAll('USDT', '');
+
+  /// 현재 시간대(봉)가 끝나는 예정 시각
+  DateTime get timeFrameEnd =>
+      DateTime.fromMillisecondsSinceEpoch(timeFrameStart).add(timeFrame.duration);
+
+  /// 현재 시간대 남은 시간 (초)
+  int get remainingSeconds {
+    final remaining = timeFrameEnd.difference(DateTime.now()).inSeconds;
+    return remaining > 0 ? remaining : 0;
+  }
+  
+  @override
+  List<Object> get props => [market, timeFrame];
+}\n\n// ====== lib/app.dart ======\n
+\n\n// ====== lib/presentation/binance_live_page.dart ======\n
+\n\n// ====== lib/presentation/controllers/volume_controller.dart ======\n
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../core/di/volume_provider.dart';
+import '../../domain/entities/volume.dart';
+import '../../domain/usecases/volume_usecase.dart';
+
+/// VolumePage의 UI 상태를 담는 불변 클래스
+class VolumeControllerState {
+  final bool isTop100;
+
+  const VolumeControllerState({this.isTop100 = false}); // 기본값 Top 50
+
+  VolumeControllerState copyWith({bool? isTop100}) {
+    return VolumeControllerState(isTop100: isTop100 ?? this.isTop100);
+  }
+}
+
+/// VolumePage의 상태와 로직을 관리하는 컨트롤러
+class VolumeController extends StateNotifier<VolumeControllerState> {
+  final Ref _ref;
+
+  VolumeController(this._ref) : super(const VolumeControllerState());
+
+  // --- UI 상태 변경 메서드 ---
+
+  /// Top 50과 Top 100 표시를 토글합니다.
+  void toggleTopLimit() {
+    state = state.copyWith(isTop100: !state.isTop100);
+  }
+
+  /// 시간대(TimeFrame)를 변경합니다.
+  void setTimeFrame(TimeFrame newTimeFrame) {
+    _ref.read(volumeTimeFrameProvider.notifier).state = newTimeFrame;
+  }
+
+  // --- 비즈니스 로직 호출 메서드 ---
+
+  /// 현재 시간대의 거래량을 리셋합니다.
+  void resetCurrentTimeFrame() {
+    final usecase = _ref.read(volumeUsecaseProvider);
+    final currentTimeFrame = _ref.read(volumeTimeFrameProvider);
+    usecase.resetTimeFrame(currentTimeFrame);
+  }
+
+  // --- UI에 필요한 데이터 getter ---
+
+  /// 현재 선택된 시간대
+  TimeFrame get currentTimeFrame => _ref.watch(volumeTimeFrameProvider);
+  
+  /// 사용 가능한 모든 시간대 목록
+  List<TimeFrame> get availableTimeFrames => TimeFrame.values;
+  
+  /// 현재 표시할 목록 개수 (50 또는 100)
+  int get currentLimit => state.isTop100 ? 100 : 50;
+  
+  /// 현재 표시 모드 이름
+  String get currentLimitName => state.isTop100 ? 'Top 100' : 'Top 50';
+}
+
+
+/// VolumeController를 제공하는 최종 Provider
+final volumeControllerProvider =
+    StateNotifierProvider.autoDispose<VolumeController, VolumeControllerState>((ref) {
+  return VolumeController(ref);
+});\n\n// ====== lib/presentation/controllers/trade_controller.dart ======\n
+// lib/presentation/controllers/trade_controller.dart
+
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../core/common/time_frame_types.dart';
+import '../../core/di/core_provider.dart';
+import '../../domain/entities/trade.dart';
+
+// State 클래스는 변경 없음
+class TradeControllerState {
+  final bool isLoading;
+  final String? errorMessage;
+  final List<Trade> trades;
+  final TradeFilter currentFilter;
+  final int selectedFilterIndex;
+
+  TradeControllerState({
+    this.isLoading = true,
+    this.errorMessage,
+    this.trades = const [],
+    required this.currentFilter,
+    required this.selectedFilterIndex,
+  });
+
+  TradeControllerState copyWith({
+    bool? isLoading,
+    String? errorMessage,
+    List<Trade>? trades,
+    TradeFilter? currentFilter,
+    int? selectedFilterIndex,
+  }) {
+    return TradeControllerState(
+      isLoading: isLoading ?? this.isLoading,
+      errorMessage: errorMessage,
+      trades: trades ?? this.trades,
+      currentFilter: currentFilter ?? this.currentFilter,
+      selectedFilterIndex: selectedFilterIndex ?? this.selectedFilterIndex,
+    );
+  }
+}
+
+// Controller 클래스 수정
+class TradeController extends StateNotifier<TradeControllerState> {
+  final Ref _ref;
+  // ✅ StreamSubscription -> ProviderSubscription 으로 변경
+  ProviderSubscription? _filteredTradesSub;
+  ProviderSubscription? _rawStreamSub;
+
+  TradeController(this._ref)
+      : super(TradeControllerState(
+          currentFilter: _ref.read(tradeFilterProvider),
+          selectedFilterIndex: TradeFilter.values.indexOf(_ref.read(tradeFilterProvider)),
+        )) {
+    _listenToTrades();
+  }
+
+  void _listenToTrades() {
+    // raw stream의 로딩/에러 상태를 감지
+    _rawStreamSub = _ref.listen<AsyncValue<Trade>>(
+      rawTradeStreamProvider,
+      (previous, next) {
+        if (state.isLoading && !next.isLoading) {
+          state = state.copyWith(isLoading: false);
+        }
+        if (next.hasError) {
+          state = state.copyWith(errorMessage: next.error.toString(), isLoading: false);
+        }
+      },
+      fireImmediately: true,
+    );
+
+    // 필터링된 최종 목록을 구독하여 UI에 표시할 trades를 업데이트
+    _filteredTradesSub = _ref.listen<List<Trade>>(
+      filteredTradesProvider, 
+      (previous, next) {
+        state = state.copyWith(trades: next, isLoading: false);
+      },
+      fireImmediately: true,
+    );
+  }
+
+  void setThreshold(TradeFilter newFilter) {
+    _ref.read(tradeFilterProvider.notifier).state = newFilter;
+    state = state.copyWith(
+      currentFilter: newFilter,
+      selectedFilterIndex: TradeFilter.values.indexOf(newFilter),
+    );
+  }
+
+  List<TradeFilter> get availableFilters => TradeFilter.values;
+  String get currentFilterDisplayName => state.currentFilter.displayName;
+
+  @override
+  void dispose() {
+    // ✅ 구독 취소 방식을 .close()로 변경
+    _filteredTradesSub?.close();
+    _rawStreamSub?.close();
+    super.dispose();
+  }
+}
+
+// Provider 정의는 변경 없음
+final tradeControllerProvider =
+    StateNotifierProvider.autoDispose<TradeController, TradeControllerState>((ref) {
+  return TradeController(ref);
+});\n\n// ====== lib/presentation/pages/main_page.dart ======\n
+// lib/presentation/pages/main_page.dart
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../widgets/common_app_bar.dart';
+import '../widgets/slide_indicator.dart';
+import 'trade_page.dart';
+import 'volume_page.dart';
+
+class MainPage extends ConsumerStatefulWidget {
+  const MainPage({Key? key}) : super(key: key);
+
+  @override
+  ConsumerState<MainPage> createState() => _MainPageState();
+}
+
+class _MainPageState extends ConsumerState<MainPage> {
+  late PageController _pageController;
+
+  // ✅ 메뉴는 2개만 사용
+  final List<PageInfo> _pages = const [
+    PageInfo('체결', Icons.list_alt_rounded),
+    PageInfo('거래량', Icons.bar_chart_rounded),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    // 첫 페이지를 '체결'로 설정
+    _pageController = PageController(initialPage: 0);
+  }
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: CommonAppBar(
+        pages: _pages,
+        pageController: _pageController,
+      ),
+      body: PageView(
+        controller: _pageController,
+        onPageChanged: (index) {
+          // 페이지 스와이프 시, 인디케이터의 상태도 함께 변경
+          ref.read(selectedTabProvider.notifier).state = index;
+        },
+        children: const [
+          // ✅ 페이지 위젯 목록
+          TradePage(),
+          VolumePage(),
+        ],
+      ),
+    );
+  }
+}\n\n// ====== lib/presentation/pages/trade_page.dart ======\n
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+// ✅ 사용하지 않는 import 제거
+// import '../../core/common/time_frame_types.dart';
+// import '../../core/config/app_config.dart';
+// import '../../core/di/core_provider.dart';
+
+import '../controllers/trade_controller.dart';
+import '../widgets/trade_tile.dart';
+
+class TradePage extends ConsumerWidget {
+  const TradePage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final state = ref.watch(tradeControllerProvider);
+    final controller = ref.read(tradeControllerProvider.notifier);
+
+    final slider = _buildFilterSlider(context, controller, state);
+    final tradeList = _buildTradeList(context, state);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Binance Futures - Live Trades'),
+        elevation: 1,
+      ),
+      body: Column(
+        children: [
+          slider,
+          const Divider(height: 1),
+          Expanded(child: tradeList),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFilterSlider(
+    BuildContext context,
+    TradeController controller,
+    TradeControllerState state,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Minimum Value: ${state.currentFilter.displayName}',
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  fontWeight: FontWeight.bold,
+                ),
+          ),
+          Slider(
+            value: state.selectedFilterIndex.toDouble(),
+            min: 0,
+            max: (controller.availableFilters.length - 1).toDouble(),
+            divisions: controller.availableFilters.length - 1,
+            label: state.currentFilter.displayName,
+            onChanged: (value) {
+              final newFilter = controller.availableFilters[value.round()];
+              controller.setThreshold(newFilter);
+            },
+            onChangeEnd: (_) {
+              HapticFeedback.mediumImpact();
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTradeList(BuildContext context, TradeControllerState state) {
+    if (state.isLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (state.errorMessage != null) {
+      return Center(child: Text('Error: ${state.errorMessage}'));
+    }
+    if (state.trades.isEmpty) {
+      return Center(
+        child: Text(
+          'No trades captured.\n(Threshold: ${state.currentFilter.displayName})',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Theme.of(context).hintColor),
+        ),
+      );
+    }
+    
+    return RawScrollbar(
+      thumbVisibility: true,
+      trackVisibility: true,
+      interactive: true,
+      thickness: 8,
+      radius: const Radius.circular(4),
+      child: ListView.separated(
+        padding: const EdgeInsets.symmetric(vertical: 8.0),
+        itemCount: state.trades.length,
+        itemBuilder: (context, index) {
+          return TradeTile(trade: state.trades[index]);
+        },
+        separatorBuilder: (context, index) => Divider(
+          height: 1,
+          thickness: 1,
+          // ✅ .withOpacity(0.1) -> .withAlpha(25)로 수정 (0.1 * 255 = 25.5)
+          color: Theme.of(context).dividerColor.withAlpha(25),
+          indent: 16,
+          endIndent: 16,
+        ),
+      ),
+    );
+  }
+}\n\n// ====== lib/presentation/pages/volume_page.dart ======\n
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../core/common/time_frame_types.dart';
+import '../../core/di/volume_provider.dart';
+import '../../domain/entities/volume.dart';
+import '../controllers/volume_controller.dart';
+import '../widgets/volume_tile.dart';
+
+class VolumePage extends ConsumerWidget {
+  const VolumePage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final volumeDataAsync = ref.watch(volumeDataProvider);
+    final uiState = ref.watch(volumeControllerProvider);
+    final controller = ref.read(volumeControllerProvider.notifier);
+    
+    return Column(
+      children: [
+        // ✅ [수정] ref를 전달하여 오류 해결
+        _buildControls(context, ref, controller, uiState),
+        const Divider(height: 1),
+        Expanded(
+          child: volumeDataAsync.when(
+            data: (volumes) => _buildVolumeList(context, volumes, uiState),
+            loading: () => const Center(child: CircularProgressIndicator()),
+            error: (e, st) => Center(child: Text('Error: $e')),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildControls(BuildContext context, WidgetRef ref, VolumeController controller, VolumeControllerState uiState) {
+    final currentTimeFrame = controller.currentTimeFrame;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Text(
+                'Timeframe: ${currentTimeFrame.displayName}',
+                style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold),
+              ),
+              _buildTopLimitToggle(controller, uiState),
+              // ✅ [수정] ref를 전달하여 오류 해결
+              _buildCountdownWidget(context, ref),
+            ],
+          ),
+          Slider(
+            value: TimeFrame.values.indexOf(currentTimeFrame).toDouble(),
+            min: 0,
+            max: (controller.availableTimeFrames.length - 1).toDouble(),
+            divisions: controller.availableTimeFrames.length - 1,
+            label: currentTimeFrame.displayName,
+            onChanged: (value) {
+              final newTimeFrame = controller.availableTimeFrames[value.round()];
+              controller.setTimeFrame(newTimeFrame);
+            },
+            onChangeEnd: (_) => HapticFeedback.mediumImpact(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTopLimitToggle(VolumeController controller, VolumeControllerState uiState) {
+    return GestureDetector(
+      onTap: () {
+        HapticFeedback.lightImpact();
+        controller.toggleTopLimit();
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          // ✅ [수정] .withOpacity -> .withAlpha로 변경
+          color: uiState.isTop100 ? Colors.orange.withAlpha(51) : Colors.transparent, // 0.2 opacity
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.orange.withAlpha(179), width: 1.5), // 0.7 opacity
+        ),
+        child: Text(
+          controller.currentLimitName,
+          style: const TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: Colors.orange,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCountdownWidget(BuildContext context, WidgetRef ref) {
+    final volumeData = ref.watch(volumeDataProvider);
+    final remainingSeconds = volumeData.when(
+      data: (volumes) => volumes.isNotEmpty ? volumes.first.remainingSeconds : 0,
+      loading: () => 0,
+      error: (_, __) => 0,
+    );
+    
+    final minutes = remainingSeconds ~/ 60;
+    final seconds = remainingSeconds % 60;
+    final timeStr = '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.timer_outlined, size: 16, color: Theme.of(context).hintColor),
+        const SizedBox(width: 4),
+        SizedBox(
+          width: 42,
+          child: Text(
+            timeStr,
+            style: const TextStyle(
+              fontSize: 14,
+              color: Colors.orange,
+              fontWeight: FontWeight.bold,
+              fontFamily: 'monospace',
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildVolumeList(BuildContext context, List<Volume> volumes, VolumeControllerState uiState) {
+    if (volumes.isEmpty) {
+      return const Center(child: Text('거래량 데이터가 없습니다.'));
+    }
+    
+    final limitedList = volumes.take(uiState.isTop100 ? 100 : 50).toList();
+    
+    return RawScrollbar(
+      thumbVisibility: true,
+      thickness: 8,
+      radius: const Radius.circular(4),
+      child: ListView.builder(
+        primary: false,
+        padding: const EdgeInsets.symmetric(vertical: 4.0, horizontal: 12.0),
+        itemCount: limitedList.length,
+        itemBuilder: (context, index) => VolumeTile(
+          volume: limitedList[index],
+          rank: index + 1,
+        ),
+      ),
+    );
+  }
+}\n\n// ====== lib/presentation/widgets/trade_tile.dart ======\n
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart';
+import '../../domain/entities/trade.dart';
+
+class TradeTile extends ConsumerWidget {
+  final Trade trade;
+
+  const TradeTile({Key? key, required this.trade}) : super(key: key);
+
+  static final _timeFormat = DateFormat('HH:mm:ss');
+  static final _quantityFormat = NumberFormat('#,##0.###');
+  static final _totalFormat = NumberFormat('#,##0');
+
+  String _formatPrice(double price) {
+    if (price < 0.01) return price.toStringAsFixed(6);
+    if (price < 1) return price.toStringAsFixed(4);
+    if (price < 100) return price.toStringAsFixed(2);
+    return price.toStringAsFixed(1);
+  }
+
+  String _getDisplayName(WidgetRef ref) {
+    return trade.market.replaceAll('USDT', '');
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final theme = Theme.of(context);
+    final bool isBuy = trade.isBuy;
+    final Color sideColor = isBuy ? Colors.green.shade400 : Colors.red.shade400;
+
+    return Card(
+      elevation: 1.5,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            // ✅ 시간 (Flex: 13)
+            Expanded(
+              flex: 13,
+              child: Text(
+                _timeFormat.format(trade.dateTime),
+                style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+              ),
+            ),
+
+            // ✅ 티커 (Flex: 17)
+            Expanded(
+              flex: 17,
+              child: Text(
+                _getDisplayName(ref),
+                style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+
+            // ✅ 가격 / 수량 (Flex: 20)
+            Expanded(
+              flex: 20,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    // ✅ 가격 앞에 '$' 기호 추가
+                    '\$${_formatPrice(trade.price)}',
+                    style: theme.textTheme.bodyMedium?.copyWith(fontFamily: 'monospace'),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    _quantityFormat.format(trade.quantity),
+                    style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                  ),
+                ],
+              ),
+            ),
+
+            // ✅ 총액 (Flex: 20)
+            Expanded(
+              flex: 20,
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: Text(
+                  // ✅ 총액 앞에 '$' 기호 추가
+                  '\$${_totalFormat.format(trade.totalValue)}',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.bold,
+                    fontFamily: 'monospace',
+                    color: sideColor,
+                  ),
+                ),
+              ),
+            ),
+
+            // 방향 아이콘
+            Padding(
+              padding: const EdgeInsets.only(left: 10.0),
+              child: Icon(
+                isBuy ? Icons.arrow_upward : Icons.arrow_downward,
+                color: sideColor,
+                size: 18,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}\n\n// ====== lib/presentation/widgets/common_app_bar.dart ======\n
+// lib/presentation/widgets/common_app_bar.dart
+import 'package:flutter/material.dart';
+import 'slide_indicator.dart';
+
+class CommonAppBar extends StatelessWidget implements PreferredSizeWidget {
+  final List<PageInfo> pages;
+  final PageController pageController;
+
+  const CommonAppBar({
+    Key? key,
+    required this.pages,
+    required this.pageController,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return AppBar(
+      elevation: 0.5,
+      // AppBar 중앙에 페이지 전환 인디케이터를 배치
+      title: SlideIndicator(
+        pages: pages,
+        pageController: pageController,
+      ),
+      centerTitle: true,
+    );
+  }
+
+  @override
+  Size get preferredSize => const Size.fromHeight(kToolbarHeight);
+}\n\n// ====== lib/presentation/widgets/volume_tile.dart ======\n
+import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import '../../domain/entities/volume.dart';
+
+final Map<String, int> _previousRanks = {};
+
+class VolumeTile extends StatefulWidget {
+  final Volume volume;
+  final int rank;
+
+  const VolumeTile({
+    Key? key,
+    required this.volume,
+    required this.rank,
+  }) : super(key: key);
+
+  @override
+  State<VolumeTile> createState() => _VolumeTileState();
+}
+
+class _VolumeTileState extends State<VolumeTile> with SingleTickerProviderStateMixin {
+  late AnimationController _animationController;
+  late Animation<Color?> _colorAnimation;
+
+  static final _volumeFormatter = NumberFormat.compact(locale: 'en_US');
+
+  @override
+  void initState() {
+    super.initState();
+    _animationController = AnimationController(
+      duration: const Duration(milliseconds: 750),
+      vsync: this,
+    );
+    _colorAnimation = ColorTween(begin: Colors.transparent, end: Colors.transparent)
+        .animate(_animationController);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _checkRankChange();
+    });
+  }
+
+  @override
+  void didUpdateWidget(VolumeTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.rank != oldWidget.rank) {
+      _checkRankChange();
+    }
+  }
+
+  void _checkRankChange() {
+    final previousRank = _previousRanks[widget.volume.market];
+    final currentRank = widget.rank;
+    
+    if (previousRank != null && currentRank < previousRank) {
+      _colorAnimation = ColorTween(
+        begin: Colors.green.withAlpha(102), // 0.4 opacity
+        end: Colors.transparent,
+      ).animate(CurvedAnimation(parent: _animationController, curve: Curves.easeOut));
+      _animationController.forward(from: 0.0);
+    }
+    
+    _previousRanks[widget.volume.market] = currentRank;
+  }
+  
+  @override
+  void dispose() {
+    _animationController.dispose();
+    super.dispose();
+  }
+  
+  Color _getRankColor(BuildContext context) {
+    if (widget.rank <= 3) return Colors.amber.shade600;
+    if (widget.rank <= 10) return Theme.of(context).colorScheme.primary;
+    // ✅ [수정] .withOpacity -> .withAlpha로 변경
+    return Theme.of(context).colorScheme.onSurface.withAlpha(179); // 0.7 opacity
+  }
+  
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final rankColor = _getRankColor(context);
+
+    return AnimatedBuilder(
+      animation: _colorAnimation,
+      builder: (context, child) {
+        return Container(
+          margin: const EdgeInsets.symmetric(vertical: 3.0),
+          decoration: BoxDecoration(
+            color: _colorAnimation.value,
+            borderRadius: BorderRadius.circular(8.0),
+          ),
+          child: child,
+        );
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 14.0),
+        child: Row(
+          children: [
+            Text(
+              '${widget.rank}',
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: rankColor,
+                fontWeight: FontWeight.bold,
+                fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              flex: 4,
+              child: Text(
+                widget.volume.ticker,
+                style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            Expanded(
+              flex: 5,
+              child: Text(
+                '\$${_volumeFormatter.format(widget.volume.totalValue)}',
+                textAlign: TextAlign.end,
+                style: theme.textTheme.bodyLarge?.copyWith(
+                  fontFamily: 'monospace',
+                  fontWeight: FontWeight.w500,
+                  color: theme.colorScheme.onSurface,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}\n\n// ====== lib/presentation/widgets/slide_indicator.dart ======\n
+// lib/presentation/widgets/slide_indicator.dart
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+/// 현재 선택된 탭의 인덱스를 관리하는 간단한 Provider
+final selectedTabProvider = StateProvider<int>((ref) => 0);
+
+/// 페이지 정보를 담는 간단한 클래스
+class PageInfo {
+  final String title;
+  final IconData icon;
+  const PageInfo(this.title, this.icon);
+}
+
+class SlideIndicator extends ConsumerWidget {
+  final List<PageInfo> pages;
+  final PageController pageController;
+
+  const SlideIndicator({
+    Key? key,
+    required this.pages,
+    required this.pageController,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final currentIndex = ref.watch(selectedTabProvider);
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: List.generate(pages.length, (index) {
+        final page = pages[index];
+        final isSelected = index == currentIndex;
+        final color = isSelected ? Theme.of(context).colorScheme.primary : Colors.grey;
+
+        return GestureDetector(
+          onTap: () {
+            HapticFeedback.lightImpact();
+            ref.read(selectedTabProvider.notifier).state = index;
+            pageController.animateToPage(
+              index,
+              duration: const Duration(milliseconds: 300),
+              curve: Curves.easeInOut,
+            );
+          },
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12.0),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(page.icon, color: color, size: isSelected ? 24 : 20),
+                Text(
+                  page.title,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: color,
+                    fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      }),
+    );
+  }
+}

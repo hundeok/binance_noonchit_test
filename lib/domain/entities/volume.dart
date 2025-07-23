@@ -2,12 +2,18 @@ import 'package:equatable/equatable.dart';
 
 /// 거래량 데이터를 집계할 시간대(TimeFrame)를 정의하는 Enum
 enum TimeFrame {
-  min1(1, '1분'),
-  min3(3, '3분'),
-  min5(5, '5분'),
-  min15(15, '15분'),
-  min30(30, '30분'),
-  hour1(60, '1시간');
+  min1(1, '1m'),
+  min3(3, '3m'),
+  min5(5, '5m'),
+  min15(15, '15m'),
+  min30(30, '30m'),
+  hour1(60, '1h'),
+  hour2(120, '2h'),
+  hour4(240, '4h'),
+  hour6(360, '6h'),
+  hour12(720, '12h'),
+  day1(1440, '1d'),
+  week1(10080, '1w');
 
   const TimeFrame(this.minutes, this.displayName);
   final int minutes;
