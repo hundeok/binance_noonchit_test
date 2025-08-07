@@ -46,138 +46,354 @@ final volumeDataProvider = StreamProvider.autoDispose<List<Volume>>((ref) {
 // lib/data/repositories/volume_repository_impl.dart
 
 import 'dart:async';
-import 'package:collection/collection.dart'; // sorted를 위해 import 추가
+import 'package:collection/collection.dart';
 import '../../core/utils/logger.dart';
 import '../../domain/entities/trade.dart';
 import '../../domain/entities/volume.dart';
 import '../../domain/repositories/volume_repository.dart';
 import '../datasources/trade_remote_ds.dart';
 
+/// 🎯 바이낸스 전용 볼륨 Repository (TradeRepositoryImpl 스타일 적용)
+/// - 브로드캐스트 스트림 활용으로 효율적인 데이터 처리
+/// - 스트림 타입별 차별화된 볼륨 계산
+/// - 메모리 효율적인 배치 업데이트
 class VolumeRepositoryImpl implements VolumeRepository {
   final TradeRemoteDataSource _remoteDataSource;
-
+  
+  // 🎯 브로드캐스트 스트림 컨트롤러들
   final Map<TimeFrame, StreamController<List<Volume>>> _controllers = {};
-  StreamSubscription? _rawTradeSub;
+  
+  // 📊 볼륨 캐시 시스템
   final Map<TimeFrame, Map<String, double>> _volumeCache = {};
   final Map<TimeFrame, DateTime> _timeFrameStartTimes = {};
+  
+  // 🔄 스트림 관리
+  StreamSubscription<Trade>? _masterStreamSub;
+  bool _isInitialized = false;
+  List<String>? _currentMarkets;
+  
+  // ⏰ 타이머들
   Timer? _batchUpdateTimer;
   Timer? _resetCheckTimer;
-  bool _isInitialized = false;
+  
+  // 📈 성능 모니터링
+  int _processedTradeCount = 0;
+  DateTime? _lastUpdateTime;
+  
+  // 성능 최적화 상수
+  static const Duration _batchUpdateInterval = Duration(milliseconds: 100);
+  static const Duration _resetCheckInterval = Duration(seconds: 15);
 
   VolumeRepositoryImpl(this._remoteDataSource) {
+    _initializeControllers();
+    _startResetCheckTimer();
+    log.i('[VolumeRepository] Initialized');
+  }
+
+  /// 🚀 컨트롤러들 초기화
+  void _initializeControllers() {
     for (final tf in TimeFrame.values) {
       _controllers[tf] = StreamController<List<Volume>>.broadcast();
-      _volumeCache[tf] = {};
+      _volumeCache[tf] = <String, double>{};
       _timeFrameStartTimes[tf] = DateTime.now();
     }
-    _resetCheckTimer = Timer.periodic(const Duration(seconds: 15), (_) => _checkTimeFrameResets());
   }
 
-  void _initialize(List<String> markets) {
-    if (_isInitialized) return;
-    _isInitialized = true;
-    final rawTradeStream = _remoteDataSource.watchTrades(markets);
-    _rawTradeSub = rawTradeStream.listen(_processTrade);
-    log.i('[VolumeRepo] Initialized.');
-  }
-
-  void _processTrade(Trade trade) {
-    for (final tf in TimeFrame.values) {
-      final cache = _volumeCache[tf]!;
-      cache[trade.market] = (cache[trade.market] ?? 0) + trade.totalValue;
+  /// 🔥 마스터 스트림 초기화 (TradeRepositoryImpl 스타일)
+  void _initializeMasterStream(List<String> markets) {
+    if (_isInitialized && _marketsEqual(_currentMarkets, markets)) {
+      return; // 이미 같은 마켓으로 초기화됨
     }
-    _scheduleBatchUpdate();
+
+    log.i('[VolumeRepository] Initializing master stream for ${markets.length} markets');
+    
+    // 기존 스트림 정리
+    _cleanupMasterStream();
+    
+    _currentMarkets = List<String>.from(markets);
+    _isInitialized = true;
+
+    // ✅ TradeRemoteDataSource의 브로드캐스트 스트림 구독
+    _masterStreamSub = _remoteDataSource.watch(markets).listen(
+      _processTrade,
+      onError: (error, stackTrace) {
+        log.e('[VolumeRepository] Master stream error', error, stackTrace);
+      },
+      onDone: () {
+        log.w('[VolumeRepository] Master stream done');
+      },
+      cancelOnError: false,
+    );
+
+    log.i('[VolumeRepository] Master stream initialized successfully');
   }
 
+  /// 📥 거래 데이터 처리 (스트림 타입별 차별화)
+  void _processTrade(Trade trade) {
+    try {
+      // ✅ 데이터 검증
+      if (!trade.isValidData) {
+        log.w('[VolumeRepository] Invalid trade data: ${trade.market}');
+        return;
+      }
+
+      _processedTradeCount++;
+      _lastUpdateTime = DateTime.now();
+
+      // ✅ [핵심] 스트림 타입별 볼륨 계산 전략
+      double volumeToAdd = 0.0;
+      
+      switch (trade.streamType) {
+        case BinanceStreamType.aggTrade:
+          // aggTrade: 실제 거래 볼륨 사용
+          volumeToAdd = trade.totalValue;
+          break;
+          
+        case BinanceStreamType.ticker:
+          // ticker: 24시간 거래량 정보 (quoteVolume) 사용
+          volumeToAdd = trade.totalValue; // ticker의 경우 이미 누적 볼륨
+          break;
+          
+        case BinanceStreamType.bookTicker:
+        case BinanceStreamType.depth5:
+          // 호가 데이터는 볼륨 계산에서 제외
+          return;
+      }
+
+      if (volumeToAdd <= 0) return;
+
+      // 모든 타임프레임에 볼륨 추가
+      for (final tf in TimeFrame.values) {
+        final cache = _volumeCache[tf]!;
+        cache[trade.market] = (cache[trade.market] ?? 0.0) + volumeToAdd;
+      }
+
+      // 배치 업데이트 스케줄링
+      _scheduleBatchUpdate();
+
+    } catch (e, st) {
+      log.e('[VolumeRepository] Trade processing error', e, st);
+    }
+  }
+
+  /// ⏰ 배치 업데이트 스케줄링 (TradeRepositoryImpl 스타일)
   void _scheduleBatchUpdate() {
     _batchUpdateTimer?.cancel();
-    _batchUpdateTimer = Timer(const Duration(milliseconds: 100), _performBatchUpdate);
+    _batchUpdateTimer = Timer(_batchUpdateInterval, _performBatchUpdate);
   }
 
+  /// 📊 실제 UI 업데이트 수행
   void _performBatchUpdate() {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    for (final tf in TimeFrame.values) {
-      final cache = _volumeCache[tf]!;
-      final startTime = _timeFrameStartTimes[tf]!;
+    try {
+      final now = DateTime.now().millisecondsSinceEpoch;
       
-      final volumeList = cache.entries.map((entry) => Volume(
-            market: entry.key,
-            totalValue: entry.value,
-            lastUpdated: now,
-            timeFrame: tf,
-            timeFrameStart: startTime.millisecondsSinceEpoch,
-          ))
-      // ✅ sortedBy -> sorted로 변경하고, null 안정성 처리
-      .sorted((a, b) => b.totalValue.compareTo(a.totalValue));
-      
-      _controllers[tf]?.add(volumeList);
-    }
-  }
-
-  void _checkTimeFrameResets() {
-    final now = DateTime.now();
-    for (final tf in TimeFrame.values) {
-      final startTime = _timeFrameStartTimes[tf]!;
-      if (now.difference(startTime) >= tf.duration) {
-        _resetTimeFrame(tf, now);
+      for (final tf in TimeFrame.values) {
+        final cache = _volumeCache[tf]!;
+        final startTime = _timeFrameStartTimes[tf]!;
+        
+        if (cache.isEmpty) continue;
+        
+        // Volume 객체 리스트 생성 및 정렬
+        final volumeList = cache.entries
+            .map((entry) => Volume(
+                  market: entry.key,
+                  totalValue: entry.value,
+                  lastUpdated: now,
+                  timeFrame: tf,
+                  timeFrameStart: startTime.millisecondsSinceEpoch,
+                ))
+            .sorted((a, b) => b.totalValue.compareTo(a.totalValue));
+        
+        // 브로드캐스트 스트림에 업데이트 전송
+        final controller = _controllers[tf];
+        if (controller != null && !controller.isClosed) {
+          controller.add(volumeList);
+        }
       }
+
+    } catch (e, st) {
+      log.e('[VolumeRepository] Batch update error', e, st);
     }
   }
 
-  void _resetTimeFrame(TimeFrame timeFrame, DateTime newStartTime) {
-    _volumeCache[timeFrame]?.clear();
-    _timeFrameStartTimes[timeFrame] = newStartTime;
-    _performBatchUpdate();
+  /// ⏰ 타임프레임 리셋 체크 타이머 시작
+  void _startResetCheckTimer() {
+    _resetCheckTimer = Timer.periodic(_resetCheckInterval, (_) {
+      _checkTimeFrameResets();
+    });
   }
+
+  /// 🔄 타임프레임 리셋 체크
+  void _checkTimeFrameResets() {
+    try {
+      final now = DateTime.now();
+      
+      for (final tf in TimeFrame.values) {
+        final startTime = _timeFrameStartTimes[tf]!;
+        if (now.difference(startTime) >= tf.duration) {
+          _resetTimeFrame(tf, now);
+          log.d('[VolumeRepository] Auto-reset timeframe: ${tf.name}');
+        }
+      }
+    } catch (e, st) {
+      log.e('[VolumeRepository] Reset check error', e, st);
+    }
+  }
+
+  /// 🔄 특정 타임프레임 리셋
+  void _resetTimeFrame(TimeFrame timeFrame, DateTime newStartTime) {
+    try {
+      _volumeCache[timeFrame]?.clear();
+      _timeFrameStartTimes[timeFrame] = newStartTime;
+      
+      // 즉시 업데이트 (빈 리스트 전송)
+      final controller = _controllers[timeFrame];
+      if (controller != null && !controller.isClosed) {
+        controller.add(<Volume>[]);
+      }
+      
+      log.i('[VolumeRepository] Reset timeframe: ${timeFrame.name}');
+    } catch (e, st) {
+      log.e('[VolumeRepository] Reset timeframe error', e, st);
+    }
+  }
+
+  /// 🔄 마스터 스트림 정리
+  void _cleanupMasterStream() {
+    _masterStreamSub?.cancel();
+    _masterStreamSub = null;
+    _isInitialized = false;
+  }
+
+  /// 🔍 마켓 리스트 비교
+  bool _marketsEqual(List<String>? a, List<String>? b) {
+    if (a == null || b == null) return false;
+    if (a.length != b.length) return false;
+    return Set<String>.from(a).containsAll(b);
+  }
+
+  // ===================================================================
+  // VolumeRepository 인터페이스 구현
+  // ===================================================================
 
   @override
   Stream<List<Volume>> watchVolumeRanking(TimeFrame timeFrame, List<String> markets) {
-    _initialize(markets);
+    log.d('[VolumeRepository] watchVolumeRanking() called for ${timeFrame.name} with ${markets.length} markets');
+    
+    // 마스터 스트림 초기화
+    _initializeMasterStream(markets);
+    
+    // 즉시 현재 상태 업데이트
     Future.microtask(_performBatchUpdate);
-    return _controllers[timeFrame]?.stream ?? const Stream.empty();
+    
+    // 해당 타임프레임 스트림 반환
+    final controller = _controllers[timeFrame];
+    return controller?.stream ?? const Stream.empty();
   }
 
   @override
   void resetTimeFrame(TimeFrame timeFrame) {
+    log.i('[VolumeRepository] Manual reset requested for ${timeFrame.name}');
     _resetTimeFrame(timeFrame, DateTime.now());
   }
 
   @override
   void resetAllTimeFrames() {
+    log.i('[VolumeRepository] Manual reset requested for ALL timeframes');
     final now = DateTime.now();
     for (final tf in TimeFrame.values) {
       _resetTimeFrame(tf, now);
     }
   }
 
+  /// ✅ [추가] 현재 상태 조회
+  Map<String, dynamic> getStatus() {
+    return {
+      'isInitialized': _isInitialized,
+      'currentMarkets': _currentMarkets?.length ?? 0,
+      'processedTradeCount': _processedTradeCount,
+      'lastUpdateTime': _lastUpdateTime?.toIso8601String(),
+      'timeFrameCacheSize': _volumeCache.map((tf, cache) => MapEntry(tf.name, cache.length)),
+      'timeFrameStartTimes': _timeFrameStartTimes.map((tf, time) => MapEntry(tf.name, time.toIso8601String())),
+    };
+  }
+
+  /// ✅ [추가] 특정 타임프레임의 마켓 수 조회
+  int getMarketCountForTimeFrame(TimeFrame timeFrame) {
+    return _volumeCache[timeFrame]?.length ?? 0;
+  }
+
   @override
-  void dispose() {
-    _rawTradeSub?.cancel();
+  Future<void> dispose() async {
+    log.i('[VolumeRepository] Disposing... Status: ${getStatus()}');
+    
+    // 타이머들 정리
     _batchUpdateTimer?.cancel();
     _resetCheckTimer?.cancel();
-    for (var controller in _controllers.values) {
-      controller.close();
+    
+    // 마스터 스트림 정리
+    _cleanupMasterStream();
+    
+    // 컨트롤러들 정리
+    for (final controller in _controllers.values) {
+      if (!controller.isClosed) {
+        await controller.close();
+      }
     }
-    log.i('[VolumeRepo] Disposed.');
+    _controllers.clear();
+    
+    // 캐시 정리
+    _volumeCache.clear();
+    _timeFrameStartTimes.clear();
+    _currentMarkets = null;
+    
+    log.i('[VolumeRepository] Disposed successfully');
   }
 }\n\n// ====== lib/data/processors/volume_processor.dart ======\n
 \n\n// ====== lib/domain/repositories/volume_repository.dart ======\n
+// lib/domain/repositories/volume_repository.dart
+
 import '../entities/trade.dart';
 import '../entities/volume.dart';
 
-/// 시간대별 거래량 데이터의 집계 및 제공을 담당하는 Repository 인터페이스
+/// 🎯 바이낸스 시간대별 거래량 데이터 Repository 인터페이스
+/// - 멀티 스트림 타입 기반 볼륨 계산 (aggTrade, ticker 등)
+/// - 실시간 타임프레임별 거래량 순위 제공
+/// - 메모리 효율적인 배치 업데이트 시스템
 abstract class VolumeRepository {
-  /// 지정된 시간대의 거래량 순위 스트림을 제공합니다.
+  /// 📊 지정된 시간대의 거래량 순위 스트림을 제공합니다.
+  /// 
+  /// [timeFrame] 집계 시간 단위 (1분, 5분, 1시간 등)
+  /// [markets] 구독할 마켓 목록 (예: ['BTCUSDT', 'ETHUSDT'])
+  /// Returns: 거래량 순으로 정렬된 Volume 리스트의 실시간 스트림
   Stream<List<Volume>> watchVolumeRanking(TimeFrame timeFrame, List<String> markets);
 
-  /// 특정 시간대의 누적 거래량을 수동으로 리셋합니다.
+  /// 🔄 특정 시간대의 누적 거래량을 수동으로 리셋합니다.
+  /// 
+  /// [timeFrame] 리셋할 타임프레임
   void resetTimeFrame(TimeFrame timeFrame);
 
-  /// 모든 시간대의 누적 거래량을 수동으로 리셋합니다.
+  /// 🔄 모든 시간대의 누적 거래량을 수동으로 리셋합니다.
+  /// 
+  /// 모든 타임프레임의 볼륨 캐시를 즉시 초기화
   void resetAllTimeFrames();
 
-  /// 리소스를 정리합니다.
-  void dispose();
+  /// ✅ [추가] 현재 상태 조회
+  /// 
+  /// Repository의 현재 상태 정보를 제공 (디버깅/모니터링용)
+  /// Returns: 초기화 상태, 처리된 거래 수, 캐시 크기 등의 상태 정보
+  Map<String, dynamic> getStatus();
+
+  /// ✅ [추가] 특정 타임프레임의 마켓 수 조회
+  /// 
+  /// [timeFrame] 조회할 타임프레임
+  /// Returns: 해당 타임프레임에서 거래량이 기록된 마켓 수
+  int getMarketCountForTimeFrame(TimeFrame timeFrame);
+
+  /// 🧹 리소스를 정리합니다.
+  /// 
+  /// 스트림 구독, 타이머, 메모리 캐시 등 모든 리소스 해제
+  Future<void> dispose();
 }\n\n// ====== lib/domain/usecases/volume_usecase.dart ======\n
 // lib/domain/usecases/volume_usecase.dart
 

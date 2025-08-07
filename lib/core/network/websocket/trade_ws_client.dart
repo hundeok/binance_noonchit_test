@@ -207,6 +207,9 @@ class TradeWsClient extends BaseWsClient<Trade> {
           return _parseAggTradeData(data, 'direct', verboseLogging);
         case '24hrTicker':
           return _parseTickerData(data, 'direct', verboseLogging);
+        case 'depthUpdate':
+          // depth5/depth 이벤트 직접 처리
+          return _parseDepth5Data(data, 'direct', verboseLogging);
         default:
           if (verboseLogging) {
             log.w('[TradeWS] Unsupported event type: $eventType');
@@ -268,23 +271,76 @@ class TradeWsClient extends BaseWsClient<Trade> {
     return trade;
   }
 
-  /// ✅ depth5 데이터 파싱
+  /// ✅ depth5 데이터 파싱 (수정된 버전 - 바이낸스 필드명 지원)
   static Trade? _parseDepth5Data(Map<String, dynamic> data, String streamInfo, bool verboseLogging) {
-    if (!data.containsKey('bids') || !data.containsKey('asks')) return null;
-
-    // streamInfo에서 심볼 추출
-    final symbol = _extractSymbolFromStreamName(streamInfo);
-    final trade = Trade.fromDepth5(data, symbol);
-
     if (verboseLogging) {
-      final bids = data['bids'] as List;
-      final asks = data['asks'] as List;
-      final bestBid = bids.isNotEmpty ? bids[0][0] : '0';
-      final bestAsk = asks.isNotEmpty ? asks[0][0] : '0';
-      log.d('[TradeWS] 📋 $symbol: bid $bestBid / ask $bestAsk (depth5: $streamInfo)');
+      print('🔍 [TradeWS] Depth5 parsing attempt');
+      print('🔍 [TradeWS] Stream info: $streamInfo');
+      print('🔍 [TradeWS] Data keys: ${data.keys.toList()}');
+    }
+    
+    // ✅ 수정: 바이낸스는 'b'(bids)와 'a'(asks) 필드를 사용
+    if (!data.containsKey('b') || !data.containsKey('a')) {
+      if (verboseLogging) {
+        print('🚨 [TradeWS] Missing b/a fields in depth5 data');
+        print('🚨 [TradeWS] Available keys: ${data.keys.join(', ')}');
+      }
+      return null;
     }
 
-    return trade;
+    try {
+      // streamInfo에서 심볼 추출
+      final symbol = _extractSymbolFromStreamName(streamInfo);
+      
+      // 심볼이 데이터에 있으면 우선 사용
+      if (data.containsKey('s')) {
+        final dataSymbol = data['s'] as String;
+        if (dataSymbol.isNotEmpty) {
+          final trade = Trade.fromDepth5(data, dataSymbol);
+          
+          if (verboseLogging) {
+            final bids = data['b'] as List;
+            final asks = data['a'] as List;
+            final bestBid = bids.isNotEmpty ? bids[0][0] : '0';
+            final bestAsk = asks.isNotEmpty ? asks[0][0] : '0';
+            log.d('[TradeWS] 📋 $dataSymbol: bid $bestBid / ask $bestAsk (depth5: $streamInfo)');
+            print('✅ [TradeWS] Depth5 trade created successfully: ${trade.market}');
+          }
+
+          return trade;
+        }
+      }
+      
+      // fallback: streamInfo에서 추출한 심볼 사용
+      if (symbol != 'UNKNOWN') {
+        final trade = Trade.fromDepth5(data, symbol);
+        
+        if (verboseLogging) {
+          final bids = data['b'] as List;
+          final asks = data['a'] as List;
+          final bestBid = bids.isNotEmpty ? bids[0][0] : '0';
+          final bestAsk = asks.isNotEmpty ? asks[0][0] : '0';
+          log.d('[TradeWS] 📋 $symbol: bid $bestBid / ask $bestAsk (depth5: $streamInfo)');
+          print('✅ [TradeWS] Depth5 trade created successfully: ${trade.market}');
+        }
+
+        return trade;
+      }
+      
+      if (verboseLogging) {
+        print('🚨 [TradeWS] No valid symbol found for depth5 data');
+      }
+      return null;
+      
+    } catch (e, st) {
+      if (verboseLogging) {
+        print('🚨 [TradeWS] Depth5 parsing error: $e');
+        print('🚨 [TradeWS] Stack trace: $st');
+        print('🚨 [TradeWS] Raw data that caused error: $data');
+      }
+      log.e('[TradeWS] Depth5 parsing failed ($streamInfo)', e, st);
+      return null;
+    }
   }
 
   /// 스트림 이름에서 심볼 추출
@@ -332,16 +388,15 @@ class StreamSubscriptionConfig {
     this.depth5Count = 0,
   });
 
-  /// 🎯 계층적 기본 설정 (Core 30개 완전분석 + Mid 120개 기본모니터링)
+  /// 🎯 계층적 기본 설정 (Core 1개 완전분석 + Mid 0개 기본모니터링)
   factory StreamSubscriptionConfig.defaultConfig() {
     return const StreamSubscriptionConfig(
-      aggTradeCount: 30,    // Core: 상위 30개 심볼 (모든 스트림)
-      tickerCount: 150,     // Core 30개 + Mid 120개 (ticker)
-      bookTickerCount: 30,  // Core 30개만 (호가 데이터)
-      depth5Count: 30,      // Core 30개만 (세부 호가)
+      aggTradeCount: 1,     // Core: 1개 심볼
+      tickerCount: 1,       // Core 1개 심볼 (ticker 포함)
+      bookTickerCount: 1,   // Core 1개 심볼 (bookTicker 포함)
+      depth5Count: 1,       // Core 1개 심볼 (depth5 포함)
     );
-    // 결과: Core 30개는 4개 스트림, Mid 120개는 1개 스트림
-    // 총 스트림: (30 * 4) + (120 * 1) = 240개
+    // 총 스트림: 1 * 4 = 4개
   }
 
   /// 보수적 설정 (Core 20개 + Mid 30개)

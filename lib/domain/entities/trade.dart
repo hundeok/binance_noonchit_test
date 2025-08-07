@@ -112,10 +112,22 @@ class Trade extends Equatable {
     );
   }
 
-  /// ✅ [추가] 바이낸스 `depth5` 스트림 데이터로부터 Trade 객체 생성
+  /// ✅ [수정] 바이낸스 `depth5` 스트림 데이터로부터 Trade 객체 생성 (실제 바이낸스 형식 지원)
   factory Trade.fromDepth5(Map<String, dynamic> json, String symbol) {
-    final bids = json['bids'] as List;
-    final asks = json['asks'] as List;
+    // ✅ 수정: 바이낸스 실제 depth5 데이터는 'b'(bids), 'a'(asks) 필드 사용
+    List<dynamic> bids;
+    List<dynamic> asks;
+    
+    // 실제 바이낸스 depth5 형식 ('b', 'a')과 정규화된 형식 ('bids', 'asks') 모두 지원
+    if (json.containsKey('b') && json.containsKey('a')) {
+      bids = json['b'] as List;
+      asks = json['a'] as List;
+    } else if (json.containsKey('bids') && json.containsKey('asks')) {
+      bids = json['bids'] as List;
+      asks = json['asks'] as List;
+    } else {
+      throw ArgumentError('Missing order book data: expected b/a or bids/asks fields');
+    }
     
     if (bids.isEmpty || asks.isEmpty) {
       throw ArgumentError('Empty order book data');
@@ -131,14 +143,34 @@ class Trade extends Equatable {
     final midPrice = (bestBid + bestAsk) / 2;
     final avgQty = (bidQty + askQty) / 2;
     
+    // ✅ 수정: updateId 필드 처리 개선
+    String updateId = 'unknown';
+    if (json.containsKey('u')) {
+      // 바이낸스 실제 depth5: 'u' 필드
+      updateId = json['u'].toString();
+    } else if (json.containsKey('lastUpdateId')) {
+      // 정규화된 형식: 'lastUpdateId' 필드
+      updateId = json['lastUpdateId'].toString();
+    }
+    
+    // ✅ 개선: timestamp 처리
+    int timestamp = DateTime.now().millisecondsSinceEpoch;
+    if (json.containsKey('E')) {
+      // Event time이 있으면 사용
+      timestamp = json['E'] as int;
+    } else if (json.containsKey('T')) {
+      // Transaction time이 있으면 사용
+      timestamp = json['T'] as int;
+    }
+    
     return Trade(
       market: symbol,
       price: midPrice,
       quantity: avgQty,
       totalValue: midPrice * avgQty,
       isBuy: true, // depth는 방향성 없음
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-      tradeId: 'depth_${symbol}_${json['lastUpdateId']}',
+      timestamp: timestamp,
+      tradeId: 'depth_${symbol}_$updateId',
       streamType: BinanceStreamType.depth5,
       rawData: json,
     );
@@ -207,6 +239,62 @@ class Trade extends Equatable {
     return ask - bid;
   }
 
+  /// ✅ [추가] depth5 스트림 전용 접근자들
+  
+  /// depth5 스트림 전용: 최고 매수 호가 (rawData에서 추출)
+  double? get depth5BestBid {
+    if (streamType != BinanceStreamType.depth5 || rawData == null) return null;
+    
+    // 'b' 필드에서 추출
+    if (rawData!.containsKey('b')) {
+      final bids = rawData!['b'] as List?;
+      if (bids != null && bids.isNotEmpty) {
+        return double.tryParse(bids[0][0].toString());
+      }
+    }
+    
+    // 'bids' 필드에서 추출 (fallback)
+    if (rawData!.containsKey('bids')) {
+      final bids = rawData!['bids'] as List?;
+      if (bids != null && bids.isNotEmpty) {
+        return double.tryParse(bids[0][0].toString());
+      }
+    }
+    
+    return null;
+  }
+  
+  /// depth5 스트림 전용: 최고 매도 호가
+  double? get depth5BestAsk {
+    if (streamType != BinanceStreamType.depth5 || rawData == null) return null;
+    
+    // 'a' 필드에서 추출
+    if (rawData!.containsKey('a')) {
+      final asks = rawData!['a'] as List?;
+      if (asks != null && asks.isNotEmpty) {
+        return double.tryParse(asks[0][0].toString());
+      }
+    }
+    
+    // 'asks' 필드에서 추출 (fallback)
+    if (rawData!.containsKey('asks')) {
+      final asks = rawData!['asks'] as List?;
+      if (asks != null && asks.isNotEmpty) {
+        return double.tryParse(asks[0][0].toString());
+      }
+    }
+    
+    return null;
+  }
+  
+  /// depth5 스트림 전용: 스프레드
+  double? get depth5Spread {
+    final bid = depth5BestBid;
+    final ask = depth5BestAsk;
+    if (bid == null || ask == null) return null;
+    return ask - bid;
+  }
+
   /// ✅ [추가] 유틸리티 메서드들
   
   /// 스트림 타입별 표시용 문자열
@@ -271,6 +359,22 @@ class Trade extends Equatable {
       'streamType': streamType.name,
       'isValid': isValidData,
       'hasRawData': rawData != null,
+      // ✅ 추가: 스트림별 특화 정보
+      if (streamType == BinanceStreamType.ticker) ...{
+        'priceChangePercent': priceChangePercent,
+        'highPrice': highPrice,
+        'lowPrice': lowPrice,
+      },
+      if (streamType == BinanceStreamType.bookTicker) ...{
+        'bestBidPrice': bestBidPrice,
+        'bestAskPrice': bestAskPrice,
+        'spread': spread,
+      },
+      if (streamType == BinanceStreamType.depth5) ...{
+        'depth5BestBid': depth5BestBid,
+        'depth5BestAsk': depth5BestAsk,
+        'depth5Spread': depth5Spread,
+      },
     };
   }
 

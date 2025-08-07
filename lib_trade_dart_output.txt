@@ -1,6 +1,10 @@
 \n\n// ====== lib/core/di/trade_provider.dart ======\n
 \n\n// ====== lib/core/network/websocket/clients/trade_ws_client.dart ======\n
-\n\n// ====== lib/core/network/websocket/trade_ws_client.dart ======\n
+\n\n// ====== lib/core/network/websocket/trade_ws_client_total.dart ======\n
+
+// TODO: 임시 비활성화
+/*
+
 import 'dart:convert';
 import 'dart:math';
 import '../../config/app_config.dart';
@@ -8,37 +12,208 @@ import '../../../domain/entities/trade.dart';
 import '../../utils/logger.dart';
 import 'base_ws_client.dart';
 
-/// 🎯 바이낸스 선물 aggTrade 스트림 전용 클라이언트 (백서 100% 준수)
+/// 🚀 바이낸스 Futures 토탈 완전체 WebSocket 클라이언트
+/// 25개 모든 스트림 타입 지원 + 고르게 분배 전략
 class TradeWsClient extends BaseWsClient<Trade> {
+  
+  /// 구독할 스트림 구성 설정 (토탈 완전체)
+  final TotalStreamSubscriptionConfig config;
+  final bool enableVerboseLogging;
 
   TradeWsClient({
     void Function(WsStatus status)? onStatusChange,
-    bool enableVerboseLogging = false,
-  }) : super(
+    this.enableVerboseLogging = false,
+    TotalStreamSubscriptionConfig? config,
+  }) : config = config ?? TotalStreamSubscriptionConfig.totalBalanced(),
+        super(
           url: AppConfig.streamUrl,
           onStatusChange: onStatusChange,
           pongTimeout: AppConfig.wsPongTimeout,
-          encodeSubscribe: (markets) => _encodeSubscribeMessage(markets),
-          // ✅ [수정] 다시 static 메서드를 전달하여 이니셜라이저 오류 해결
+          encodeSubscribe: (markets) => _encodeSubscribeMessage(markets, config ?? TotalStreamSubscriptionConfig.totalBalanced()),
           decode: (json) => _decodeTradeMessage(json, enableVerboseLogging),
         );
 
   // ===================================================================
-  // 📨 구독 메시지 인코딩 (바이낸스 백서 준수)
+  // 📨 토탈 멀티 스트림 구독 메시지 인코딩 (25개 스트림 지원)
   // ===================================================================
 
-  static String _encodeSubscribeMessage(List<String> markets) {
-    if (markets.length > AppConfig.wsMaxStreams) {
-      throw ArgumentError('Too many streams: ${markets.length}. '
+  static String _encodeSubscribeMessage(List<String> markets, TotalStreamSubscriptionConfig config) {
+    final params = <String>[];
+    
+    // 스트림 개수 계산 및 제한 체크
+    final totalStreams = _calculateTotalStreams(markets.length, config);
+    if (totalStreams > AppConfig.wsMaxStreams) {
+      throw ArgumentError('Too many streams: $totalStreams. '
           'Binance limit: ${AppConfig.wsMaxStreams} streams per connection.');
     }
 
-    final params =
-        markets.map((symbol) => '${symbol.toLowerCase()}@aggTrade').toList();
+    // ===================================================================
+    // 🎯 거래 데이터 스트림들
+    // ===================================================================
     
-    // ✅ [수정] String ID를 사용하도록 변경
-    final messageId = _generateUniqueMessageId();
+    if (config.aggTradeCount > 0) {
+      final symbols = markets.take(config.aggTradeCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@aggTrade'));
+      log.i('[TradeWS] 📈 Added ${symbols.length} aggTrade streams');
+    }
 
+    if (config.tradeCount > 0) {
+      final symbols = markets.take(config.tradeCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@trade'));
+      log.i('[TradeWS] 💱 Added ${symbols.length} trade streams');
+    }
+
+    // ===================================================================
+    // 📊 24시간 통계 스트림들
+    // ===================================================================
+    
+    if (config.tickerCount > 0) {
+      final symbols = markets.take(config.tickerCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@ticker'));
+      log.i('[TradeWS] 📊 Added ${symbols.length} ticker streams');
+    }
+
+    if (config.miniTickerCount > 0) {
+      final symbols = markets.take(config.miniTickerCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@miniTicker'));
+      log.i('[TradeWS] 📈 Added ${symbols.length} miniTicker streams');
+    }
+
+    // ===================================================================
+    // 💰 호가 데이터 스트림들
+    // ===================================================================
+    
+    if (config.bookTickerCount > 0) {
+      final symbols = markets.take(config.bookTickerCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@bookTicker'));
+      log.i('[TradeWS] 💰 Added ${symbols.length} bookTicker streams');
+    }
+
+    if (config.depth5Count > 0) {
+      final symbols = markets.take(config.depth5Count);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@depth5'));
+      log.i('[TradeWS] 📋 Added ${symbols.length} depth5 streams');
+    }
+
+    if (config.depth10Count > 0) {
+      final symbols = markets.take(config.depth10Count);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@depth10'));
+      log.i('[TradeWS] 📋 Added ${symbols.length} depth10 streams');
+    }
+
+    if (config.depth20Count > 0) {
+      final symbols = markets.take(config.depth20Count);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@depth20'));
+      log.i('[TradeWS] 📋 Added ${symbols.length} depth20 streams');
+    }
+
+    if (config.depthCount > 0) {
+      final symbols = markets.take(config.depthCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@depth'));
+      log.i('[TradeWS] ⚡ Added ${symbols.length} depth (full) streams');
+    }
+
+    if (config.depthSpeedCount > 0) {
+      final symbols = markets.take(config.depthSpeedCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@depth@100ms'));
+      log.i('[TradeWS] 🚨 Added ${symbols.length} depth@100ms streams (HIGH VOLUME!)');
+    }
+
+    // ===================================================================
+    // 🕯️ 캔들스틱 스트림들
+    // ===================================================================
+    
+    if (config.klineCount > 0) {
+      final symbols = markets.take(config.klineCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@kline_1m')); // 기본 1분봉
+      log.i('[TradeWS] 🕯️ Added ${symbols.length} kline streams');
+    }
+
+    if (config.continuousKlineCount > 0) {
+      final symbols = markets.take(config.continuousKlineCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}_PERP@continuousKline_1m'));
+      log.i('[TradeWS] 🔄 Added ${symbols.length} continuousKline streams');
+    }
+
+    // ===================================================================
+    // ⚡ Futures 전용 스트림들
+    // ===================================================================
+    
+    if (config.markPriceCount > 0) {
+      final symbols = markets.take(config.markPriceCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@markPrice'));
+      log.i('[TradeWS] ⚡ Added ${symbols.length} markPrice streams');
+    }
+
+    if (config.fundingRateCount > 0) {
+      final symbols = markets.take(config.fundingRateCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@markPrice@1s')); // 1초 마크가격으로 펀딩 추적
+      log.i('[TradeWS] 💸 Added ${symbols.length} fundingRate streams');
+    }
+
+    // ===================================================================
+    // 🚨 특수 데이터 스트림들
+    // ===================================================================
+    
+    if (config.liquidationCount > 0) {
+      final symbols = markets.take(config.liquidationCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@forceOrder'));
+      log.i('[TradeWS] 🚨 Added ${symbols.length} liquidation streams');
+    }
+
+    if (config.compositeIndexCount > 0) {
+      final symbols = markets.take(config.compositeIndexCount);
+      params.addAll(symbols.map((s) => '${s.toLowerCase()}@compositeIndex'));
+      log.i('[TradeWS] 📈 Added ${symbols.length} compositeIndex streams');
+    }
+
+    // ===================================================================
+    // 🎯 BLVT 스트림들
+    // ===================================================================
+    
+    if (config.blvtNavCount > 0) {
+      // BLVT는 특별한 네이밍 (예: BTCUP, BTCDOWN)
+      final blvtSymbols = markets.where((s) => s.endsWith('UP') || s.endsWith('DOWN')).take(config.blvtNavCount);
+      params.addAll(blvtSymbols.map((s) => '${s.toLowerCase()}@tokenNav'));
+      log.i('[TradeWS] 🎯 Added ${blvtSymbols.length} BLVT NAV streams');
+    }
+
+    if (config.blvtKlineCount > 0) {
+      final blvtSymbols = markets.where((s) => s.endsWith('UP') || s.endsWith('DOWN')).take(config.blvtKlineCount);
+      params.addAll(blvtSymbols.map((s) => '${s.toLowerCase()}@nav_kline_1m'));
+      log.i('[TradeWS] 🎯 Added ${blvtSymbols.length} BLVT Kline streams');
+    }
+
+    // ===================================================================
+    // 🌐 전체 시장 스트림들 (심볼 무관)
+    // ===================================================================
+    
+    if (config.allMarketTickerCount > 0) {
+      params.add('!ticker@arr');
+      log.i('[TradeWS] 🌐 Added all market ticker stream');
+    }
+
+    if (config.allMarketMiniCount > 0) {
+      params.add('!miniTicker@arr');
+      log.i('[TradeWS] 🌐 Added all market miniTicker stream');
+    }
+
+    if (config.allBookTickerCount > 0) {
+      params.add('!bookTicker@arr');
+      log.i('[TradeWS] 🌐 Added all market bookTicker stream');
+    }
+
+    if (config.allMarkPriceCount > 0) {
+      params.add('!markPrice@arr');
+      log.i('[TradeWS] 🌐 Added all market markPrice stream');
+    }
+
+    if (config.allLiquidationCount > 0) {
+      params.add('!forceOrder@arr');
+      log.i('[TradeWS] 🌐 Added all market liquidation stream');
+    }
+
+    final messageId = _generateUniqueMessageId();
     final subscribeMessage = {
       'method': 'SUBSCRIBE',
       'params': params,
@@ -47,55 +222,93 @@ class TradeWsClient extends BaseWsClient<Trade> {
 
     final jsonMessage = jsonEncode(subscribeMessage);
 
-    log.i('[TradeWS] 📤 Subscribing to ${params.length} aggTrade streams');
+    log.i('[TradeWS] 🚀 총 ${params.length}개 스트림 구독 완료! (Markets: ${markets.length})');
     log.d('[TradeWS] Subscription message: $jsonMessage');
 
     return jsonMessage;
   }
 
-  /// 🎯 바이낸스 호환 고유 메시지 ID 생성 (String 반환)
+  /// 총 스트림 개수 계산
+  static int _calculateTotalStreams(int marketCount, TotalStreamSubscriptionConfig config) {
+    final symbolBasedStreams = [
+      config.aggTradeCount,
+      config.tradeCount,
+      config.tickerCount,
+      config.miniTickerCount,
+      config.bookTickerCount,
+      config.depth5Count,
+      config.depth10Count,
+      config.depth20Count,
+      config.depthCount,
+      config.depthSpeedCount,
+      config.klineCount,
+      config.continuousKlineCount,
+      config.markPriceCount,
+      config.fundingRateCount,
+      config.liquidationCount,
+      config.compositeIndexCount,
+      config.blvtNavCount,
+      config.blvtKlineCount,
+    ].map((count) => count > marketCount ? marketCount : count).fold(0, (a, b) => a + b);
+
+    final globalStreams = config.allMarketTickerCount +
+                         config.allMarketMiniCount +
+                         config.allBookTickerCount +
+                         config.allMarkPriceCount +
+                         config.allLiquidationCount;
+
+    return symbolBasedStreams + globalStreams;
+  }
+
+  /// 바이낸스 호환 고유 메시지 ID 생성
   static String _generateUniqueMessageId() {
     final timestamp = DateTime.now().millisecondsSinceEpoch;
-    // 충돌 방지를 위한 랜덤 숫자 추가
     final randomPart = Random().nextInt(99999).toString().padLeft(5, '0');
     return '$timestamp$randomPart';
   }
 
   // ===================================================================
-  // 📥 메시지 디코딩 (바이낸스 Combined Stream 처리)
+  // 📥 토탈 멀티 스트림 메시지 디코딩 (25개 스트림 처리)
   // ===================================================================
 
-  static Trade? _decodeTradeMessage(
-      Map<String, dynamic> json, bool verboseLogging) {
+  static Trade? _decodeTradeMessage(Map<String, dynamic> json, bool verboseLogging) {
     if (json.isEmpty) {
       if (verboseLogging) log.w('[TradeWS] Empty message received');
       return null;
     }
 
+    // 구독 확인 메시지 처리
     if (json.containsKey('result')) {
       if (json['result'] == null) {
         log.i('[TradeWS] ✅ Subscription confirmed: ${json['id']}');
       } else if (json['result'] is List) {
         final subscriptions = json['result'] as List;
         log.i('[TradeWS] 📋 Active subscriptions: ${subscriptions.length}');
+        if (verboseLogging) {
+          log.d('[TradeWS] Subscriptions: $subscriptions');
+        }
       }
       return null;
     }
 
+    // Combined Stream 메시지 처리
     if (json.containsKey('stream') && json.containsKey('data')) {
       final streamName = json['stream'] as String?;
       final data = json['data'];
 
-      if (streamName == null ||
-          data == null ||
-          !streamName.endsWith('@aggTrade')) {
-        return null;
-      }
-      return _parseTradeData(data, streamName, verboseLogging);
+      if (streamName == null || data == null) return null;
+      return _parseStreamData(streamName, data, verboseLogging);
     }
 
-    if (json.containsKey('e') && json['e'] == 'aggTrade') {
-      return _parseTradeData(json, 'direct', verboseLogging);
+    // Direct Stream 메시지 처리
+    if (json.containsKey('e')) {
+      final eventType = json['e'] as String;
+      return _parseDirectStreamData(eventType, json, verboseLogging);
+    }
+
+    // 전체 시장 배열 데이터 처리
+    if (json.containsKey('data') && json['data'] is List) {
+      return _parseAllMarketArrayData(json, verboseLogging);
     }
 
     if (verboseLogging) {
@@ -104,57 +317,1623 @@ class TradeWsClient extends BaseWsClient<Trade> {
     return null;
   }
 
-  /// 🎯 실제 거래 데이터 파싱
-  static Trade? _parseTradeData(
-      dynamic data, String streamInfo, bool verboseLogging) {
+  /// Combined Stream 데이터 파싱 (25개 스트림 타입 지원)
+  static Trade? _parseStreamData(String streamName, dynamic data, bool verboseLogging) {
     try {
-      if (data is! Map<String, dynamic> || data['e'] != 'aggTrade') {
-        return null;
+      if (data is! Map<String, dynamic>) return null;
+
+      // 스트림 타입 판별 및 파싱
+      if (streamName.endsWith('@aggTrade')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.aggTrade);
+      } else if (streamName.endsWith('@trade')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.trade);
+      } else if (streamName.endsWith('@ticker')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.ticker);
+      } else if (streamName.endsWith('@miniTicker')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.miniTicker);
+      } else if (streamName.endsWith('@bookTicker')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.bookTicker);
+      } else if (streamName.endsWith('@depth5')) {
+        final symbol = _extractSymbolFromStreamName(streamName);
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.depth5, symbol: symbol, levels: 5);
+      } else if (streamName.endsWith('@depth10')) {
+        final symbol = _extractSymbolFromStreamName(streamName);
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.depth10, symbol: symbol, levels: 10);
+      } else if (streamName.endsWith('@depth20')) {
+        final symbol = _extractSymbolFromStreamName(streamName);
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.depth20, symbol: symbol, levels: 20);
+      } else if (streamName.endsWith('@depth@100ms')) {
+        final symbol = _extractSymbolFromStreamName(streamName);
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.depthSpeed, symbol: symbol);
+      } else if (streamName.endsWith('@depth')) {
+        final symbol = _extractSymbolFromStreamName(streamName);
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.depth, symbol: symbol);
+      } else if (streamName.contains('@kline_')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.kline);
+      } else if (streamName.contains('@continuousKline_')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.continuousKline);
+      } else if (streamName.endsWith('@markPrice') || streamName.endsWith('@markPrice@1s')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.markPrice);
+      } else if (streamName.endsWith('@forceOrder')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.liquidation);
+      } else if (streamName.endsWith('@compositeIndex')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.compositeIndex);
+      } else if (streamName.endsWith('@tokenNav')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.blvtNav);
+      } else if (streamName.contains('@nav_kline_')) {
+        return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.blvtKline);
       }
 
-      final trade = Trade.fromBinance(data);
-
-      // ✅ [수정] Trade 객체 속성에 의존하지 않고 원본 데이터로 로그 기록
       if (verboseLogging) {
-        final symbol = data['s'] as String? ?? 'UNKNOWN';
-        final price = data['p'] as String? ?? '0';
-        final quantity = data['q'] as String? ?? '0';
-        log.d('[TradeWS] 💰 $symbol: $price × $quantity (Stream: $streamInfo)');
+        log.w('[TradeWS] Unsupported stream type: $streamName');
       }
-
-      return trade;
+      return null;
     } catch (e, st) {
-      log.e('[TradeWS] Trade parsing failed (Stream: $streamInfo)', e, st);
+      log.e('[TradeWS] Stream parsing failed ($streamName)', e, st);
       return null;
     }
   }
 
-  // ❌ [제거] 통계 관련 로직은 이 클래스의 책임을 벗어나므로 모두 제거.
-  // 이 클래스는 순수하게 데이터 스트림을 제공하는 역할만 수행.
+  /// Direct Stream 데이터 파싱
+  static Trade? _parseDirectStreamData(String eventType, Map<String, dynamic> data, bool verboseLogging) {
+    try {
+      switch (eventType) {
+        case 'aggTrade':
+          return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.aggTrade);
+        case 'trade':
+          return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.trade);
+        case '24hrTicker':
+          return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.ticker);
+        case '24hrMiniTicker':
+          return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.miniTicker);
+        case 'kline':
+          return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.kline);
+        case 'continuous_kline':
+          return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.continuousKline);
+        case 'markPriceUpdate':
+          return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.markPrice);
+        case 'forceOrder':
+          return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.liquidation);
+        case 'compositeIndex':
+          return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.compositeIndex);
+        case 'nav':
+          return Trade.fromBinanceStream(json: data, streamType: BinanceStreamType.blvtNav);
+        default:
+          if (verboseLogging) {
+            log.w('[TradeWS] Unsupported event type: $eventType');
+          }
+          return null;
+      }
+    } catch (e, st) {
+      log.e('[TradeWS] Direct stream parsing failed ($eventType)', e, st);
+      return null;
+    }
+  }
+
+  /// 전체 시장 배열 데이터 파싱 (첫 번째 항목만 반환)
+  static Trade? _parseAllMarketArrayData(Map<String, dynamic> json, bool verboseLogging) {
+    try {
+      final data = json['data'] as List;
+      if (data.isEmpty) return null;
+
+      // 스트림 이름으로 타입 판별
+      final stream = json['stream'] as String?;
+      if (stream == null) return null;
+
+      BinanceStreamType streamType;
+      if (stream.contains('ticker@arr')) {
+        streamType = BinanceStreamType.allMarketTicker;
+      } else if (stream.contains('miniTicker@arr')) {
+        streamType = BinanceStreamType.allMarketMini;
+      } else if (stream.contains('bookTicker@arr')) {
+        streamType = BinanceStreamType.allBookTicker;
+      } else if (stream.contains('markPrice@arr')) {
+        streamType = BinanceStreamType.allMarkPrice;
+      } else if (stream.contains('forceOrder@arr')) {
+        streamType = BinanceStreamType.allLiquidation;
+      } else {
+        return null;
+      }
+
+      // 첫 번째 항목만 반환 (전체 시장 데이터는 매우 클 수 있음)
+      final firstItem = data[0] as Map<String, dynamic>;
+      return Trade.fromBinanceStream(json: firstItem, streamType: streamType);
+    } catch (e, st) {
+      log.e('[TradeWS] All market array parsing failed', e, st);
+      return null;
+    }
+  }
+
+  /// 스트림 이름에서 심볼 추출
+  static String _extractSymbolFromStreamName(String streamName) {
+    if (streamName.contains('@')) {
+      return streamName.split('@')[0].toUpperCase();
+    }
+    return 'UNKNOWN';
+  }
+
+  // ===================================================================
+  // 📊 디버그 및 모니터링
+  // ===================================================================
+
+  /// 현재 구독 설정 정보
+  Map<String, dynamic> getSubscriptionInfo() {
+    return {
+      'config': config.toMap(),
+      'estimatedStreams': _calculateTotalStreams(100, config), // 가정: 100개 마켓
+      'estimatedMessageRate': _estimateMessageRate(),
+      'verboseLogging': enableVerboseLogging,
+      'totalStreamTypes': 25,
+      'isSafeConfiguration': config.isSafeConfiguration(),
+    };
+  }
+
+  /// 예상 메시지 속도 계산
+  int _estimateMessageRate() {
+    return config.aggTradeCount * 50 +       // aggTrade
+           config.tradeCount * 100 +         // trade (매우 빠름)
+           config.tickerCount * 1 +          // ticker
+           config.miniTickerCount * 1 +      // miniTicker
+           config.bookTickerCount * 10 +     // bookTicker
+           config.depth5Count * 10 +         // depth5
+           config.depth10Count * 10 +        // depth10
+           config.depth20Count * 10 +        // depth20
+           config.depthCount * 100 +         // depth (빠름)
+           config.depthSpeedCount * 500 +    // depth@100ms (매우 빠름)
+           config.klineCount * 4 +           // kline
+           config.continuousKlineCount * 4 + // continuousKline
+           config.markPriceCount * 1 +       // markPrice
+           config.fundingRateCount * 1 +     // fundingRate
+           config.liquidationCount * 5 +     // liquidation
+           config.compositeIndexCount * 1 +  // compositeIndex
+           config.blvtNavCount * 1 +         // blvtNav
+           config.blvtKlineCount * 4 +       // blvtKline
+           config.allMarketTickerCount * 200 +   // 전체 시장 (많은 심볼)
+           config.allMarketMiniCount * 200 +     // 전체 시장
+           config.allBookTickerCount * 2000 +    // 전체 시장 (매우 빠름)
+           config.allMarkPriceCount * 200 +      // 전체 시장
+           config.allLiquidationCount * 100;     // 전체 시장
+  }
+}
+
+// ===================================================================
+// 🎯 토탈 스트림 구독 설정 클래스 (25개 스트림 지원)
+// ===================================================================
+
+class TotalStreamSubscriptionConfig {
+  // === 거래 데이터 ===
+  final int aggTradeCount;        // 집계 거래
+  final int tradeCount;           // 개별 거래
+  
+  // === 24시간 통계 ===
+  final int tickerCount;          // 24시간 전체 통계
+  final int miniTickerCount;      // 24시간 간소 통계
+  
+  // === 호가 데이터 ===
+  final int bookTickerCount;      // 최고 호가
+  final int depth5Count;          // 5단계 호가창
+  final int depth10Count;         // 10단계 호가창
+  final int depth20Count;         // 20단계 호가창
+  final int depthCount;           // 전체 호가창
+  final int depthSpeedCount;      // 고속 호가창 (100ms)
+  
+  // === 캔들스틱 ===
+  final int klineCount;           // 일반 캔들
+  final int continuousKlineCount; // 연속 계약 캔들
+  
+  // === Futures 전용 ===
+  final int markPriceCount;       // 마크 가격
+  final int fundingRateCount;     // 펀딩 비율
+  
+  // === 특수 데이터 ===
+  final int liquidationCount;     // 강제청산
+  final int compositeIndexCount;  // 복합 지수
+  
+  // === BLVT ===
+  final int blvtNavCount;         // BLVT NAV
+  final int blvtKlineCount;       // BLVT 캔들
+  
+  // === 전체 시장 ===
+  final int allMarketTickerCount;    // 전체 24h 통계
+  final int allMarketMiniCount;      // 전체 간소 통계
+  final int allBookTickerCount;      // 전체 호가
+  final int allMarkPriceCount;       // 전체 마크가격
+  final int allLiquidationCount;     // 전체 강제청산
+
+  const TotalStreamSubscriptionConfig({
+    this.aggTradeCount = 0,
+    this.tradeCount = 0,
+    this.tickerCount = 0,
+    this.miniTickerCount = 0,
+    this.bookTickerCount = 0,
+    this.depth5Count = 0,
+    this.depth10Count = 0,
+    this.depth20Count = 0,
+    this.depthCount = 0,
+    this.depthSpeedCount = 0,
+    this.klineCount = 0,
+    this.continuousKlineCount = 0,
+    this.markPriceCount = 0,
+    this.fundingRateCount = 0,
+    this.liquidationCount = 0,
+    this.compositeIndexCount = 0,
+    this.blvtNavCount = 0,
+    this.blvtKlineCount = 0,
+    this.allMarketTickerCount = 0,
+    this.allMarketMiniCount = 0,
+    this.allBookTickerCount = 0,
+    this.allMarkPriceCount = 0,
+    this.allLiquidationCount = 0,
+  });
+
+  /// 🚀 토탈 밸런스 설정 (745개 스트림, 고르게 분배)
+  factory TotalStreamSubscriptionConfig.totalBalanced() {
+    return const TotalStreamSubscriptionConfig(
+      // === 거래 데이터 (60개) ===
+      aggTradeCount: 30,       // 집계 거래
+      tradeCount: 30,          // 개별 거래
+      
+      // === 24시간 통계 (60개) ===  
+      tickerCount: 30,         // 전체 통계
+      miniTickerCount: 30,     // 간소 통계
+      
+      // === 호가 데이터 (120개) ===
+      bookTickerCount: 30,     // 최고 호가
+      depth5Count: 30,         // 5단계 호가
+      depth10Count: 30,        // 10단계 호가
+      depth20Count: 30,        // 20단계 호가
+      
+      // === 캔들스틱 (60개) ===
+      klineCount: 30,          // 일반 캔들
+      continuousKlineCount: 30, // 연속 계약 캔들
+      
+      // === Futures 전용 (60개) ===
+      markPriceCount: 30,      // 마크 가격
+      fundingRateCount: 30,    // 펀딩 비율
+      
+      // === 특수 데이터 (60개) ===
+      liquidationCount: 30,    // 강제청산
+      compositeIndexCount: 30, // 복합 지수
+      
+      // === BLVT (60개) ===
+      blvtNavCount: 30,        // BLVT NAV
+      blvtKlineCount: 30,      // BLVT 캔들
+      
+      // === 전체 시장 (5개) ===
+      allMarketTickerCount: 1,     // 전체 티커
+      allMarketMiniCount: 1,       // 전체 미니
+      allBookTickerCount: 1,       // 전체 북티커
+      allMarkPriceCount: 1,        // 전체 마크가격
+      allLiquidationCount: 1,      // 전체 청산
+      
+      // === 위험 스트림 (0개) ===
+      depthCount: 0,           // 전체 호가 (빠름)
+      depthSpeedCount: 0,      // 100ms 호가 (매우 위험)
+    );
+  }
+
+  /// 보수적 설정 (안전한 스트림들만)
+  factory TotalStreamSubscriptionConfig.conservative() {
+    return const TotalStreamSubscriptionConfig(
+      aggTradeCount: 20,
+      tickerCount: 20,
+      bookTickerCount: 20,
+      depth5Count: 20,
+      markPriceCount: 20,
+      klineCount: 10,
+      liquidationCount: 10,
+      // 위험한 스트림들은 0
+      tradeCount: 0,
+      depthCount: 0,
+      depthSpeedCount: 0,
+      allBookTickerCount: 0,
+    );
+  }
+
+  /// 거래 중심 설정 (트레이딩용)
+  factory TotalStreamSubscriptionConfig.tradingFocused() {
+    return const TotalStreamSubscriptionConfig(
+      aggTradeCount: 50,       // 거래 데이터 중심
+      bookTickerCount: 50,     // 호가 데이터
+      depth5Count: 30,         // 호가창
+      markPriceCount: 30,      // 마크가격
+      tickerCount: 20,         // 기본 통계
+      liquidationCount: 20,    // 청산 모니터링
+    );
+  }
+
+  /// 분석 중심 설정 (리서치용)
+  factory TotalStreamSubscriptionConfig.analysisFocused() {
+    return const TotalStreamSubscriptionConfig(
+      tickerCount: 50,         // 통계 데이터
+      klineCount: 50,          // 캔들 데이터
+      markPriceCount: 30,      // 가격 데이터
+      liquidationCount: 30,    // 시장 동향
+      compositeIndexCount: 20, // 지수 분석
+      allMarketTickerCount: 1, // 전체 시장
+      allMarkPriceCount: 1,    // 전체 마크가격
+    );
+  }
+
+  /// 기존 호환용 (aggTrade만)
+  factory TotalStreamSubscriptionConfig.aggTradeOnly(int count) {
+    return TotalStreamSubscriptionConfig(aggTradeCount: count);
+  }
+
+  /// 총 스트림 개수
+  int get totalCount {
+    return aggTradeCount + tradeCount + tickerCount + miniTickerCount +
+           bookTickerCount + depth5Count + depth10Count + depth20Count +
+           depthCount + depthSpeedCount + klineCount + continuousKlineCount +
+           markPriceCount + fundingRateCount + liquidationCount + compositeIndexCount +
+           blvtNavCount + blvtKlineCount + allMarketTickerCount + allMarketMiniCount +
+           allBookTickerCount + allMarkPriceCount + allLiquidationCount;
+  }
+
+  /// 위험한 스트림 개수
+  int get highVolumeStreamCount {
+    return tradeCount + depthCount + depthSpeedCount + allBookTickerCount;
+  }
+
+  /// 안전한 구성인지 확인
+  bool isSafeConfiguration() {
+    final hasHighVolumeStreams = highVolumeStreamCount > 0;
+    final totalStreams = totalCount;
+    
+    return !hasHighVolumeStreams && 
+           totalStreams <= AppConfig.wsMaxStreams * 0.8; // 80% 이하
+  }
+
+  /// 예상 메시지 속도 (간단 계산)
+  int get estimatedMessageRate {
+    return aggTradeCount * 50 + tradeCount * 100 + tickerCount * 1 +
+           miniTickerCount * 1 + bookTickerCount * 10 + depth5Count * 10 +
+           depth10Count * 10 + depth20Count * 10 + depthCount * 100 +
+           depthSpeedCount * 500 + klineCount * 4 + continuousKlineCount * 4 +
+           markPriceCount * 1 + fundingRateCount * 1 + liquidationCount * 5 +
+           compositeIndexCount * 1 + blvtNavCount * 1 + blvtKlineCount * 4 +
+           allMarketTickerCount * 200 + allMarketMiniCount * 200 +
+           allBookTickerCount * 2000 + allMarkPriceCount * 200 +
+           allLiquidationCount * 100;
+  }
+
+  /// 맵으로 변환
+  Map<String, dynamic> toMap() {
+    return {
+      // 거래 데이터
+      'aggTradeCount': aggTradeCount,
+      'tradeCount': tradeCount,
+      
+      // 24시간 통계
+      'tickerCount': tickerCount,
+      'miniTickerCount': miniTickerCount,
+      
+      // 호가 데이터
+      'bookTickerCount': bookTickerCount,
+      'depth5Count': depth5Count,
+      'depth10Count': depth10Count,
+      'depth20Count': depth20Count,
+      'depthCount': depthCount,
+      'depthSpeedCount': depthSpeedCount,
+      
+      // 캔들스틱
+      'klineCount': klineCount,
+      'continuousKlineCount': continuousKlineCount,
+      
+      // Futures 전용
+      'markPriceCount': markPriceCount,
+      'fundingRateCount': fundingRateCount,
+      
+      // 특수 데이터
+      'liquidationCount': liquidationCount,
+      'compositeIndexCount': compositeIndexCount,
+      
+      // BLVT
+      'blvtNavCount': blvtNavCount,
+      'blvtKlineCount': blvtKlineCount,
+      
+      // 전체 시장
+      'allMarketTickerCount': allMarketTickerCount,
+      'allMarketMiniCount': allMarketMiniCount,
+      'allBookTickerCount': allBookTickerCount,
+      'allMarkPriceCount': allMarkPriceCount,
+      'allLiquidationCount': allLiquidationCount,
+      
+      // 요약 정보
+      'totalCount': totalCount,
+      'highVolumeStreamCount': highVolumeStreamCount,
+      'estimatedMessageRate': estimatedMessageRate,
+      'isSafe': isSafeConfiguration(),
+    };
+  }
+
+  /// 스트림 카테고리별 개수
+  Map<String, int> getCategoryBreakdown() {
+    return {
+      'Trade Data': aggTradeCount + tradeCount,
+      '24h Statistics': tickerCount + miniTickerCount,
+      'Order Book': bookTickerCount + depth5Count + depth10Count + depth20Count + depthCount + depthSpeedCount,
+      'Candlestick': klineCount + continuousKlineCount,
+      'Futures Price': markPriceCount + fundingRateCount,
+      'Special Data': liquidationCount + compositeIndexCount,
+      'BLVT': blvtNavCount + blvtKlineCount,
+      'All Market': allMarketTickerCount + allMarketMiniCount + allBookTickerCount + allMarkPriceCount + allLiquidationCount,
+    };
+  }
+
+  @override
+  String toString() {
+    return 'TotalStreamConfig(총 ${totalCount}개 스트림, 예상 ${estimatedMessageRate}msg/sec, 안전성: ${isSafeConfiguration() ? "안전" : "주의"})';
+  }
+}
+
+// 전체 코드가 여기에...
+*/\n\n// ====== lib/core/network/websocket/trade_ws_client.dart ======\n
+import 'dart:convert';
+import 'dart:math';
+import '../../config/app_config.dart';
+import '../../../domain/entities/trade.dart';
+import '../../utils/logger.dart';
+import 'base_ws_client.dart';
+
+/// 🎯 바이낸스 선물 멀티 스트림 클라이언트 (백서 100% 준수)
+/// aggTrade + ticker + bookTicker + depth5 통합 지원
+class TradeWsClient extends BaseWsClient<Trade> {
+  
+  /// ✅ [추가] 구독할 스트림 구성 설정
+  final StreamSubscriptionConfig config;
+  final bool enableVerboseLogging;
+
+  TradeWsClient({
+    void Function(WsStatus status)? onStatusChange,
+    this.enableVerboseLogging = false,
+    StreamSubscriptionConfig? config,
+  }) : config = config ?? StreamSubscriptionConfig.defaultConfig(),
+        super(
+          url: AppConfig.streamUrl,
+          onStatusChange: onStatusChange,
+          pongTimeout: AppConfig.wsPongTimeout,
+          // ✅ maxStreams, maxMessagesPerSec 제거 (AppConfig 기본값 자동 사용)
+          encodeSubscribe: (markets) => _encodeSubscribeMessage(markets, config ?? StreamSubscriptionConfig.defaultConfig()),
+          decode: (json) => _decodeTradeMessage(json, enableVerboseLogging),
+        );
+
+  // ===================================================================
+  // 📨 계층적 멀티 스트림 구독 메시지 인코딩 (중복 방지)
+  // ===================================================================
+
+  static String _encodeSubscribeMessage(List<String> markets, StreamSubscriptionConfig config) {
+    final params = <String>[];
+    
+    // 스트림 개수 계산 및 제한 체크
+    final totalStreams = _calculateTotalStreams(markets.length, config);
+    if (totalStreams > AppConfig.wsMaxStreams) {
+      throw ArgumentError('Too many streams: $totalStreams. '
+          'Binance limit: ${AppConfig.wsMaxStreams} streams per connection.');
+    }
+
+    // ===================================================================
+    // 🎯 계층적 구독 전략 (Tiered Subscription)
+    // ===================================================================
+    
+    // 상위 심볼들: 모든 스트림으로 완전 분석
+    final coreSymbols = markets.take(config.aggTradeCount);
+    final coreSymbolsList = coreSymbols.toList();
+    
+    log.i('[TradeWS] 🎯 Core symbols (완전 분석): ${coreSymbolsList.length}개');
+    
+    // ✅ 1. aggTrade 스트림 (상위 심볼만 - 상세 거래 데이터)
+    if (config.aggTradeCount > 0) {
+      params.addAll(
+        coreSymbolsList.map((symbol) => '${symbol.toLowerCase()}@aggTrade'),
+      );
+      log.i('[TradeWS] 📈 Added ${coreSymbolsList.length} aggTrade streams (Core tier)');
+    }
+
+    // ✅ 2. ticker 스트림 (상위 + 중위 심볼들)
+    if (config.tickerCount > 0) {
+      final tickerSymbols = markets.take(config.tickerCount).toList();
+      params.addAll(
+        tickerSymbols.map((symbol) => '${symbol.toLowerCase()}@ticker'),
+      );
+      log.i('[TradeWS] 📊 Added ${tickerSymbols.length} ticker streams (Core + Mid tier)');
+    }
+
+    // ✅ 3. bookTicker 스트림 (상위 심볼만 - 정밀 호가 데이터)
+    if (config.bookTickerCount > 0) {
+      final bookTickerSymbols = coreSymbolsList.take(config.bookTickerCount).toList();
+      params.addAll(
+        bookTickerSymbols.map((symbol) => '${symbol.toLowerCase()}@bookTicker'),
+      );
+      log.i('[TradeWS] 💰 Added ${bookTickerSymbols.length} bookTicker streams (Core tier only)');
+    }
+
+    // ✅ 4. depth5 스트림 (상위 심볼만 - 세부 호가창)
+    if (config.depth5Count > 0) {
+      final depth5Symbols = coreSymbolsList.take(config.depth5Count).toList();
+      params.addAll(
+        depth5Symbols.map((symbol) => '${symbol.toLowerCase()}@depth5'),
+      );
+      log.i('[TradeWS] 📋 Added ${depth5Symbols.length} depth5 streams (Core tier only)');
+    }
+
+    final messageId = _generateUniqueMessageId();
+    final subscribeMessage = {
+      'method': 'SUBSCRIBE',
+      'params': params,
+      'id': messageId,
+    };
+
+    final jsonMessage = jsonEncode(subscribeMessage);
+
+    log.i('[TradeWS] 🎯 계층적 구독 완료 - 총 ${params.length}개 스트림');
+    log.i('[TradeWS] - Core tier (${coreSymbolsList.length}개): 모든 스트림으로 완전 분석');
+    log.i('[TradeWS] - Mid tier (${config.tickerCount - coreSymbolsList.length}개): ticker로 기본 모니터링');
+    log.d('[TradeWS] Subscription message: $jsonMessage');
+
+    return jsonMessage;
+  }
+
+  /// 총 스트림 개수 계산 (계층적 구독 고려)
+  static int _calculateTotalStreams(int marketCount, StreamSubscriptionConfig config) {
+    // Core tier: aggTrade 개수만큼의 심볼이 모든 스트림 구독
+    final coreSymbolCount = config.aggTradeCount > marketCount ? marketCount : config.aggTradeCount;
+    final coreStreams = coreSymbolCount * 4; // aggTrade + ticker + bookTicker + depth5
+    
+    // Mid tier: ticker만 추가 구독 (core tier 제외)
+    final midSymbolCount = (config.tickerCount - coreSymbolCount).clamp(0, marketCount - coreSymbolCount);
+    final midStreams = midSymbolCount; // ticker만
+    
+    return coreStreams + midStreams;
+  }
+
+  /// 🎯 바이낸스 호환 고유 메시지 ID 생성 (String 반환)
+  static String _generateUniqueMessageId() {
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final randomPart = Random().nextInt(99999).toString().padLeft(5, '0');
+    return '$timestamp$randomPart';
+  }
+
+  // ===================================================================
+  // 📥 멀티 스트림 메시지 디코딩 (바이낸스 Combined Stream 처리)
+  // ===================================================================
+
+  static Trade? _decodeTradeMessage(Map<String, dynamic> json, bool verboseLogging) {
+    if (json.isEmpty) {
+      if (verboseLogging) log.w('[TradeWS] Empty message received');
+      return null;
+    }
+
+    // 구독 확인 메시지 처리
+    if (json.containsKey('result')) {
+      if (json['result'] == null) {
+        log.i('[TradeWS] ✅ Subscription confirmed: ${json['id']}');
+      } else if (json['result'] is List) {
+        final subscriptions = json['result'] as List;
+        log.i('[TradeWS] 📋 Active subscriptions: ${subscriptions.length}');
+        if (verboseLogging) {
+          log.d('[TradeWS] Subscriptions: $subscriptions');
+        }
+      }
+      return null;
+    }
+
+    // Combined Stream 메시지 처리
+    if (json.containsKey('stream') && json.containsKey('data')) {
+      final streamName = json['stream'] as String?;
+      final data = json['data'];
+
+      if (streamName == null || data == null) {
+        return null;
+      }
+
+      return _parseStreamData(streamName, data, verboseLogging);
+    }
+
+    // Direct Stream 메시지 처리 (Combined 아닌 경우)
+    if (json.containsKey('e')) {
+      final eventType = json['e'] as String;
+      return _parseDirectStreamData(eventType, json, verboseLogging);
+    }
+
+    if (verboseLogging) {
+      log.w('[TradeWS] Unknown message type: ${json.keys.join(', ')}');
+    }
+    return null;
+  }
+
+  /// ✅ Combined Stream 데이터 파싱
+  static Trade? _parseStreamData(String streamName, dynamic data, bool verboseLogging) {
+    try {
+      if (data is! Map<String, dynamic>) {
+        return null;
+      }
+
+      // 스트림 타입 판별
+      if (streamName.endsWith('@aggTrade')) {
+        return _parseAggTradeData(data, streamName, verboseLogging);
+      } else if (streamName.endsWith('@ticker')) {
+        return _parseTickerData(data, streamName, verboseLogging);
+      } else if (streamName.endsWith('@bookTicker')) {
+        return _parseBookTickerData(data, streamName, verboseLogging);
+      } else if (streamName.endsWith('@depth5')) {
+        return _parseDepth5Data(data, streamName, verboseLogging);
+      }
+
+      if (verboseLogging) {
+        log.w('[TradeWS] Unsupported stream type: $streamName');
+      }
+      return null;
+    } catch (e, st) {
+      log.e('[TradeWS] Stream parsing failed ($streamName)', e, st);
+      return null;
+    }
+  }
+
+  /// ✅ Direct Stream 데이터 파싱
+  static Trade? _parseDirectStreamData(String eventType, Map<String, dynamic> data, bool verboseLogging) {
+    try {
+      switch (eventType) {
+        case 'aggTrade':
+          return _parseAggTradeData(data, 'direct', verboseLogging);
+        case '24hrTicker':
+          return _parseTickerData(data, 'direct', verboseLogging);
+        default:
+          if (verboseLogging) {
+            log.w('[TradeWS] Unsupported event type: $eventType');
+          }
+          return null;
+      }
+    } catch (e, st) {
+      log.e('[TradeWS] Direct stream parsing failed ($eventType)', e, st);
+      return null;
+    }
+  }
+
+  /// 🎯 aggTrade 데이터 파싱
+  static Trade? _parseAggTradeData(Map<String, dynamic> data, String streamInfo, bool verboseLogging) {
+    if (data['e'] != 'aggTrade') return null;
+
+    final trade = Trade.fromAggTrade(data);
+
+    if (verboseLogging) {
+      final symbol = data['s'] as String? ?? 'UNKNOWN';
+      final price = data['p'] as String? ?? '0';
+      final quantity = data['q'] as String? ?? '0';
+      log.d('[TradeWS] 💰 $symbol: $price × $quantity (aggTrade: $streamInfo)');
+    }
+
+    return trade;
+  }
+
+  /// ✅ ticker 데이터 파싱
+  static Trade? _parseTickerData(Map<String, dynamic> data, String streamInfo, bool verboseLogging) {
+    if (data['e'] != '24hrTicker') return null;
+
+    final trade = Trade.fromTicker(data);
+
+    if (verboseLogging) {
+      final symbol = data['s'] as String? ?? 'UNKNOWN';
+      final price = data['c'] as String? ?? '0';
+      final change = data['P'] as String? ?? '0';
+      log.d('[TradeWS] 📊 $symbol: $price ($change%) (ticker: $streamInfo)');
+    }
+
+    return trade;
+  }
+
+  /// ✅ bookTicker 데이터 파싱
+  static Trade? _parseBookTickerData(Map<String, dynamic> data, String streamInfo, bool verboseLogging) {
+    // bookTicker에는 'e' 필드가 없음
+    if (!data.containsKey('u') || !data.containsKey('s')) return null;
+
+    final trade = Trade.fromBookTicker(data);
+
+    if (verboseLogging) {
+      final symbol = data['s'] as String? ?? 'UNKNOWN';
+      final bidPrice = data['b'] as String? ?? '0';
+      final askPrice = data['a'] as String? ?? '0';
+      log.d('[TradeWS] 💰 $symbol: bid $bidPrice / ask $askPrice (bookTicker: $streamInfo)');
+    }
+
+    return trade;
+  }
+
+  /// ✅ depth5 데이터 파싱
+  static Trade? _parseDepth5Data(Map<String, dynamic> data, String streamInfo, bool verboseLogging) {
+    if (!data.containsKey('bids') || !data.containsKey('asks')) return null;
+
+    // streamInfo에서 심볼 추출
+    final symbol = _extractSymbolFromStreamName(streamInfo);
+    final trade = Trade.fromDepth5(data, symbol);
+
+    if (verboseLogging) {
+      final bids = data['bids'] as List;
+      final asks = data['asks'] as List;
+      final bestBid = bids.isNotEmpty ? bids[0][0] : '0';
+      final bestAsk = asks.isNotEmpty ? asks[0][0] : '0';
+      log.d('[TradeWS] 📋 $symbol: bid $bestBid / ask $bestAsk (depth5: $streamInfo)');
+    }
+
+    return trade;
+  }
+
+  /// 스트림 이름에서 심볼 추출
+  static String _extractSymbolFromStreamName(String streamName) {
+    if (streamName.contains('@')) {
+      return streamName.split('@')[0].toUpperCase();
+    }
+    return 'UNKNOWN';
+  }
+
+  // ===================================================================
+  // 📊 디버그 및 모니터링
+  // ===================================================================
+
+  /// 현재 구독 설정 정보
+  Map<String, dynamic> getSubscriptionInfo() {
+    return {
+      'config': config.toMap(),
+      'estimatedStreams': _calculateTotalStreams(100, config), // 가정: 100개 마켓
+      'estimatedMessageRate': _estimateMessageRate(),
+      'verboseLogging': enableVerboseLogging,
+    };
+  }
+
+  /// 예상 메시지 속도 계산
+  int _estimateMessageRate() {
+    return config.aggTradeCount * 50 +    // aggTrade: ~50/초
+           config.tickerCount * 1 +       // ticker: ~1/초
+           config.bookTickerCount * 10 +  // bookTicker: ~10/초
+           config.depth5Count * 10;       // depth5: ~10/초
+  }
+}
+
+/// ✅ 계층적 스트림 구독 설정 클래스
+class StreamSubscriptionConfig {
+  final int aggTradeCount;     // Core tier 심볼 수 (모든 스트림 구독)
+  final int tickerCount;       // Core + Mid tier 심볼 수 (ticker 구독)  
+  final int bookTickerCount;   // Core tier에서 bookTicker 구독할 심볼 수
+  final int depth5Count;       // Core tier에서 depth5 구독할 심볼 수
+
+  const StreamSubscriptionConfig({
+    this.aggTradeCount = 0,
+    this.tickerCount = 0,
+    this.bookTickerCount = 0,
+    this.depth5Count = 0,
+  });
+
+  /// 🎯 계층적 기본 설정 (Core 30개 완전분석 + Mid 120개 기본모니터링)
+  factory StreamSubscriptionConfig.defaultConfig() {
+  return const StreamSubscriptionConfig(
+    aggTradeCount: 1,     // 30 → 5 (250 msg/sec)
+    tickerCount: 1,      // 150 → 20 (20 msg/sec)  
+    bookTickerCount: 1,   // 30 → 5 (50 msg/sec)
+    depth5Count: 1,       // 30 → 0 (0 msg/sec)
+  );
+    // 결과: Core 30개는 4개 스트림, Mid 120개는 1개 스트림
+    // 총 스트림: (30 * 4) + (120 * 1) = 240개
+  }
+
+  /// 보수적 설정 (Core 20개 + Mid 30개)
+  factory StreamSubscriptionConfig.conservative() {
+    return const StreamSubscriptionConfig(
+      aggTradeCount: 20,    // Core: 상위 20개만
+      tickerCount: 50,      // Core 20개 + Mid 30개
+      bookTickerCount: 20,  // Core 20개만
+      depth5Count: 20,      // Core 20개만
+    );
+    // 총 스트림: (20 * 4) + (30 * 1) = 110개
+  }
+
+  /// 집중 분석 설정 (Core 50개 완전분석)
+  factory StreamSubscriptionConfig.intensive() {
+    return const StreamSubscriptionConfig(
+      aggTradeCount: 50,    // Core: 상위 50개 심볼
+      tickerCount: 100,     // Core 50개 + Mid 50개
+      bookTickerCount: 50,  // Core 50개 전체
+      depth5Count: 50,      // Core 50개 전체  
+    );
+    // 총 스트림: (50 * 4) + (50 * 1) = 250개
+  }
+
+  /// aggTrade만 구독 (기존 호환)
+  factory StreamSubscriptionConfig.aggTradeOnly(int count) {
+    return StreamSubscriptionConfig(
+      aggTradeCount: count,
+      tickerCount: count,    // aggTrade와 같은 심볼에 ticker도 추가
+      bookTickerCount: 0,
+      depth5Count: 0,
+    );
+  }
+
+  /// Core tier 심볼 개수 (모든 스트림 구독)
+  int get coreSymbolCount => aggTradeCount;
+  
+  /// Mid tier 심볼 개수 (ticker만 구독)
+  int get midSymbolCount => (tickerCount - aggTradeCount).clamp(0, double.infinity).toInt();
+
+  /// 총 구독 심볼 개수
+  int get totalSymbolCount => tickerCount;
+
+  /// 총 스트림 개수 (계층적 계산)
+  int get totalStreamCount {
+    final coreStreams = coreSymbolCount * 4; // 4개 스트림씩
+    final midStreams = midSymbolCount * 1;   // 1개 스트림씩
+    return coreStreams + midStreams;
+  }
+
+  /// 계층별 구성 정보
+  Map<String, dynamic> getTierBreakdown() {
+    return {
+      'core': {
+        'symbolCount': coreSymbolCount,
+        'streams': ['aggTrade', 'ticker', 'bookTicker', 'depth5'],
+        'streamCount': coreSymbolCount * 4,
+        'description': '완전 분석 (모든 스트림)',
+      },
+      'mid': {
+        'symbolCount': midSymbolCount,
+        'streams': ['ticker'],
+        'streamCount': midSymbolCount * 1,
+        'description': '기본 모니터링 (ticker만)',
+      },
+    };
+  }
+
+  /// 맵으로 변환
+  Map<String, dynamic> toMap() {
+    return {
+      'aggTradeCount': aggTradeCount,
+      'tickerCount': tickerCount,
+      'bookTickerCount': bookTickerCount,
+      'depth5Count': depth5Count,
+      'coreSymbolCount': coreSymbolCount,
+      'midSymbolCount': midSymbolCount,
+      'totalSymbolCount': totalSymbolCount,
+      'totalStreamCount': totalStreamCount,
+      'tierBreakdown': getTierBreakdown(),
+    };
+  }
+
+  @override
+  String toString() {
+    return 'StreamConfig(Core: ${coreSymbolCount}개 완전분석, Mid: ${midSymbolCount}개 기본모니터링, 총 ${totalStreamCount}개 스트림)';
+  }
+}\n\n// ====== lib/core/network/websocket/trade_ws_client copy.dart ======\n
+import 'dart:convert';
+import 'dart:math';
+import '../../config/app_config.dart';
+import '../../../domain/entities/trade.dart';
+import '../../utils/logger.dart';
+import 'base_ws_client.dart';
+
+/// 🎯 바이낸스 선물 멀티 스트림 클라이언트 (백서 100% 준수)
+/// aggTrade + ticker + bookTicker + depth5 통합 지원
+class TradeWsClient extends BaseWsClient<Trade> {
+  
+  /// ✅ [추가] 구독할 스트림 구성 설정
+  final StreamSubscriptionConfig config;
+  final bool enableVerboseLogging;
+
+  TradeWsClient({
+    void Function(WsStatus status)? onStatusChange,
+    this.enableVerboseLogging = false,
+    StreamSubscriptionConfig? config,
+  }) : config = config ?? StreamSubscriptionConfig.defaultConfig(),
+        super(
+          url: AppConfig.streamUrl,
+          onStatusChange: onStatusChange,
+          pongTimeout: AppConfig.wsPongTimeout,
+          // ✅ maxStreams, maxMessagesPerSec 제거 (AppConfig 기본값 자동 사용)
+          encodeSubscribe: (markets) => _encodeSubscribeMessage(markets, config ?? StreamSubscriptionConfig.defaultConfig()),
+          decode: (json) => _decodeTradeMessage(json, enableVerboseLogging),
+        );
+
+  // ===================================================================
+  // 📨 멀티 스트림 구독 메시지 인코딩 (바이낸스 백서 준수)
+  // ===================================================================
+
+  static String _encodeSubscribeMessage(List<String> markets, StreamSubscriptionConfig config) {
+    final params = <String>[];
+    
+    // 스트림 개수 계산 및 제한 체크
+    final totalStreams = _calculateTotalStreams(markets.length, config);
+    if (totalStreams > AppConfig.wsMaxStreams) {
+      throw ArgumentError('Too many streams: $totalStreams. '
+          'Binance limit: ${AppConfig.wsMaxStreams} streams per connection.');
+    }
+
+    // ✅ 1. aggTrade 스트림 (상세 거래 데이터)
+    if (config.aggTradeCount > 0) {
+      final aggTradeMarkets = markets.take(config.aggTradeCount);
+      params.addAll(
+        aggTradeMarkets.map((symbol) => '${symbol.toLowerCase()}@aggTrade'),
+      );
+      log.i('[TradeWS] 📈 Added ${aggTradeMarkets.length} aggTrade streams');
+    }
+
+    // ✅ 2. ticker 스트림 (24시간 통계)
+    if (config.tickerCount > 0) {
+      final tickerMarkets = markets.take(config.tickerCount);
+      params.addAll(
+        tickerMarkets.map((symbol) => '${symbol.toLowerCase()}@ticker'),
+      );
+      log.i('[TradeWS] 📊 Added ${tickerMarkets.length} ticker streams');
+    }
+
+    // ✅ 3. bookTicker 스트림 (최고 호가)
+    if (config.bookTickerCount > 0) {
+      final bookTickerMarkets = markets.take(config.bookTickerCount);
+      params.addAll(
+        bookTickerMarkets.map((symbol) => '${symbol.toLowerCase()}@bookTicker'),
+      );
+      log.i('[TradeWS] 💰 Added ${bookTickerMarkets.length} bookTicker streams');
+    }
+
+    // ✅ 4. depth5 스트림 (5단계 호가창)
+    if (config.depth5Count > 0) {
+      final depth5Markets = markets.take(config.depth5Count);
+      params.addAll(
+        depth5Markets.map((symbol) => '${symbol.toLowerCase()}@depth5'),
+      );
+      log.i('[TradeWS] 📋 Added ${depth5Markets.length} depth5 streams');
+    }
+
+    final messageId = _generateUniqueMessageId();
+    final subscribeMessage = {
+      'method': 'SUBSCRIBE',
+      'params': params,
+      'id': messageId,
+    };
+
+    final jsonMessage = jsonEncode(subscribeMessage);
+
+    log.i('[TradeWS] 🎯 총 ${params.length}개 스트림 구독 (Markets: ${markets.length})');
+    log.d('[TradeWS] Subscription message: $jsonMessage');
+
+    return jsonMessage;
+  }
+
+  /// 총 스트림 개수 계산
+  static int _calculateTotalStreams(int marketCount, StreamSubscriptionConfig config) {
+    return [
+      config.aggTradeCount,
+      config.tickerCount,
+      config.bookTickerCount,
+      config.depth5Count,
+    ].map((count) => count > marketCount ? marketCount : count).fold(0, (a, b) => a + b);
+  }
+
+  /// 🎯 바이낸스 호환 고유 메시지 ID 생성 (String 반환)
+  static String _generateUniqueMessageId() {
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final randomPart = Random().nextInt(99999).toString().padLeft(5, '0');
+    return '$timestamp$randomPart';
+  }
+
+  // ===================================================================
+  // 📥 멀티 스트림 메시지 디코딩 (바이낸스 Combined Stream 처리)
+  // ===================================================================
+
+  static Trade? _decodeTradeMessage(Map<String, dynamic> json, bool verboseLogging) {
+    if (json.isEmpty) {
+      if (verboseLogging) log.w('[TradeWS] Empty message received');
+      return null;
+    }
+
+    // 구독 확인 메시지 처리
+    if (json.containsKey('result')) {
+      if (json['result'] == null) {
+        log.i('[TradeWS] ✅ Subscription confirmed: ${json['id']}');
+      } else if (json['result'] is List) {
+        final subscriptions = json['result'] as List;
+        log.i('[TradeWS] 📋 Active subscriptions: ${subscriptions.length}');
+        if (verboseLogging) {
+          log.d('[TradeWS] Subscriptions: $subscriptions');
+        }
+      }
+      return null;
+    }
+
+    // Combined Stream 메시지 처리
+    if (json.containsKey('stream') && json.containsKey('data')) {
+      final streamName = json['stream'] as String?;
+      final data = json['data'];
+
+      if (streamName == null || data == null) {
+        return null;
+      }
+
+      return _parseStreamData(streamName, data, verboseLogging);
+    }
+
+    // Direct Stream 메시지 처리 (Combined 아닌 경우)
+    if (json.containsKey('e')) {
+      final eventType = json['e'] as String;
+      return _parseDirectStreamData(eventType, json, verboseLogging);
+    }
+
+    if (verboseLogging) {
+      log.w('[TradeWS] Unknown message type: ${json.keys.join(', ')}');
+    }
+    return null;
+  }
+
+  /// ✅ Combined Stream 데이터 파싱
+  static Trade? _parseStreamData(String streamName, dynamic data, bool verboseLogging) {
+    try {
+      if (data is! Map<String, dynamic>) {
+        return null;
+      }
+
+      // 스트림 타입 판별
+      if (streamName.endsWith('@aggTrade')) {
+        return _parseAggTradeData(data, streamName, verboseLogging);
+      } else if (streamName.endsWith('@ticker')) {
+        return _parseTickerData(data, streamName, verboseLogging);
+      } else if (streamName.endsWith('@bookTicker')) {
+        return _parseBookTickerData(data, streamName, verboseLogging);
+      } else if (streamName.endsWith('@depth5')) {
+        return _parseDepth5Data(data, streamName, verboseLogging);
+      }
+
+      if (verboseLogging) {
+        log.w('[TradeWS] Unsupported stream type: $streamName');
+      }
+      return null;
+    } catch (e, st) {
+      log.e('[TradeWS] Stream parsing failed ($streamName)', e, st);
+      return null;
+    }
+  }
+
+  /// ✅ Direct Stream 데이터 파싱
+  static Trade? _parseDirectStreamData(String eventType, Map<String, dynamic> data, bool verboseLogging) {
+    try {
+      switch (eventType) {
+        case 'aggTrade':
+          return _parseAggTradeData(data, 'direct', verboseLogging);
+        case '24hrTicker':
+          return _parseTickerData(data, 'direct', verboseLogging);
+        default:
+          if (verboseLogging) {
+            log.w('[TradeWS] Unsupported event type: $eventType');
+          }
+          return null;
+      }
+    } catch (e, st) {
+      log.e('[TradeWS] Direct stream parsing failed ($eventType)', e, st);
+      return null;
+    }
+  }
+
+  /// 🎯 aggTrade 데이터 파싱
+  static Trade? _parseAggTradeData(Map<String, dynamic> data, String streamInfo, bool verboseLogging) {
+    if (data['e'] != 'aggTrade') return null;
+
+    final trade = Trade.fromAggTrade(data);
+
+    if (verboseLogging) {
+      final symbol = data['s'] as String? ?? 'UNKNOWN';
+      final price = data['p'] as String? ?? '0';
+      final quantity = data['q'] as String? ?? '0';
+      log.d('[TradeWS] 💰 $symbol: $price × $quantity (aggTrade: $streamInfo)');
+    }
+
+    return trade;
+  }
+
+  /// ✅ ticker 데이터 파싱
+  static Trade? _parseTickerData(Map<String, dynamic> data, String streamInfo, bool verboseLogging) {
+    if (data['e'] != '24hrTicker') return null;
+
+    final trade = Trade.fromTicker(data);
+
+    if (verboseLogging) {
+      final symbol = data['s'] as String? ?? 'UNKNOWN';
+      final price = data['c'] as String? ?? '0';
+      final change = data['P'] as String? ?? '0';
+      log.d('[TradeWS] 📊 $symbol: $price ($change%) (ticker: $streamInfo)');
+    }
+
+    return trade;
+  }
+
+  /// ✅ bookTicker 데이터 파싱
+  static Trade? _parseBookTickerData(Map<String, dynamic> data, String streamInfo, bool verboseLogging) {
+    // bookTicker에는 'e' 필드가 없음
+    if (!data.containsKey('u') || !data.containsKey('s')) return null;
+
+    final trade = Trade.fromBookTicker(data);
+
+    if (verboseLogging) {
+      final symbol = data['s'] as String? ?? 'UNKNOWN';
+      final bidPrice = data['b'] as String? ?? '0';
+      final askPrice = data['a'] as String? ?? '0';
+      log.d('[TradeWS] 💰 $symbol: bid $bidPrice / ask $askPrice (bookTicker: $streamInfo)');
+    }
+
+    return trade;
+  }
+
+  /// ✅ depth5 데이터 파싱
+  static Trade? _parseDepth5Data(Map<String, dynamic> data, String streamInfo, bool verboseLogging) {
+    if (!data.containsKey('bids') || !data.containsKey('asks')) return null;
+
+    // streamInfo에서 심볼 추출
+    final symbol = _extractSymbolFromStreamName(streamInfo);
+    final trade = Trade.fromDepth5(data, symbol);
+
+    if (verboseLogging) {
+      final bids = data['bids'] as List;
+      final asks = data['asks'] as List;
+      final bestBid = bids.isNotEmpty ? bids[0][0] : '0';
+      final bestAsk = asks.isNotEmpty ? asks[0][0] : '0';
+      log.d('[TradeWS] 📋 $symbol: bid $bestBid / ask $bestAsk (depth5: $streamInfo)');
+    }
+
+    return trade;
+  }
+
+  /// 스트림 이름에서 심볼 추출
+  static String _extractSymbolFromStreamName(String streamName) {
+    if (streamName.contains('@')) {
+      return streamName.split('@')[0].toUpperCase();
+    }
+    return 'UNKNOWN';
+  }
+
+  // ===================================================================
+  // 📊 디버그 및 모니터링
+  // ===================================================================
+
+  /// 현재 구독 설정 정보
+  Map<String, dynamic> getSubscriptionInfo() {
+    return {
+      'config': config.toMap(),
+      'estimatedStreams': _calculateTotalStreams(100, config), // 가정: 100개 마켓
+      'estimatedMessageRate': _estimateMessageRate(),
+      'verboseLogging': enableVerboseLogging,
+    };
+  }
+
+  /// 예상 메시지 속도 계산
+  int _estimateMessageRate() {
+    return config.aggTradeCount * 50 +    // aggTrade: ~50/초
+           config.tickerCount * 1 +       // ticker: ~1/초
+           config.bookTickerCount * 10 +  // bookTicker: ~10/초
+           config.depth5Count * 10;       // depth5: ~10/초
+  }
+}
+
+/// ✅ 스트림 구독 설정 클래스
+class StreamSubscriptionConfig {
+  final int aggTradeCount;     // aggTrade 스트림 개수
+  final int tickerCount;       // ticker 스트림 개수  
+  final int bookTickerCount;   // bookTicker 스트림 개수
+  final int depth5Count;       // depth5 스트림 개수
+
+  const StreamSubscriptionConfig({
+    this.aggTradeCount = 0,
+    this.tickerCount = 0,
+    this.bookTickerCount = 0,
+    this.depth5Count = 0,
+  });
+
+  /// 기본 설정 (우리가 계획한 400개 스트림)
+  factory StreamSubscriptionConfig.defaultConfig() {
+    return const StreamSubscriptionConfig(
+      aggTradeCount: 100,    // Trade + Volume용
+      tickerCount: 150,      // Surge용
+      bookTickerCount: 100,  // 호가용
+      depth5Count: 50,       // 세부 호가용
+    );
+  }
+
+  /// aggTrade만 구독 (기존 방식 호환)
+  factory StreamSubscriptionConfig.aggTradeOnly(int count) {
+    return StreamSubscriptionConfig(aggTradeCount: count);
+  }
+
+  /// 보수적 설정 (적은 스트림)
+  factory StreamSubscriptionConfig.conservative() {
+    return const StreamSubscriptionConfig(
+      aggTradeCount: 30,
+      tickerCount: 50,
+      bookTickerCount: 30,
+      depth5Count: 20,
+    );
+  }
+
+  /// 총 스트림 개수
+  int get totalCount => aggTradeCount + tickerCount + bookTickerCount + depth5Count;
+
+  /// 맵으로 변환
+  Map<String, dynamic> toMap() {
+    return {
+      'aggTradeCount': aggTradeCount,
+      'tickerCount': tickerCount,
+      'bookTickerCount': bookTickerCount,
+      'depth5Count': depth5Count,
+      'totalCount': totalCount,
+    };
+  }
+
+  @override
+  String toString() {
+    return 'StreamConfig(aggTrade: $aggTradeCount, ticker: $tickerCount, '
+           'bookTicker: $bookTickerCount, depth5: $depth5Count, total: $totalCount)';
+  }
 }\n\n// ====== lib/data/datasources/trade_remote_ds.dart ======\n
 // lib/data/datasources/trade_remote_ds.dart
 
-import '../../core/network/websocket/trade_ws_client.dart';
+import 'dart:async';
+import 'dart:math';
+import 'package:flutter/foundation.dart';
+import '../../../core/bridge/signal_bus.dart';
+import '../../../core/event/app_event.dart';
+import '../../../core/network/websocket/trade_ws_client.dart';
 import '../../domain/entities/trade.dart';
 
-/// 원격 WebSocket으로부터 실시간 Trade 데이터를 수신하는 데이터 소스
+/// 🎯 바이낸스 선물 실시간 Trade 데이터 소스 (업비트 스타일 브로드캐스트)
+/// - 멀티 스트림 지원 (aggTrade, ticker, bookTicker, depth5)
+/// - 브로드캐스트로 여러 Repository 동시 구독 가능
+/// - 에러 시 자동 폴백으로 안정성 확보
 class TradeRemoteDataSource {
-  final TradeWsClient _wsClient;
+  final TradeWsClient _ws;
+  final SignalBus _signalBus;
+  final bool _useTestData;
 
-  TradeRemoteDataSource(this._wsClient);
+  // 🆕 브로드캐스트 시스템
+  StreamController<Trade>? _masterController;
+  StreamSubscription<Trade>? _wsSub; // ✅ 타입 수정: Trade로 직접 받기
+  bool _disposed = false;
+  List<String>? _currentMarkets; // 현재 구독 중인 마켓들
+  int _subscriberCount = 0; // 구독자 수 추적
 
-  /// WebSocket 클라이언트에 마켓 구독을 요청하고,
-  /// 반환되는 순수 Trade 스트림을 그대로 전달합니다.
-  Stream<Trade> watchTrades(List<String> markets) {
-    _wsClient.connect(markets);
-    return _wsClient.stream;
+  // 📊 성능 모니터링
+  int _messageCount = 0;
+  DateTime? _lastMessageTime;
+  Timer? _performanceTimer;
+
+  TradeRemoteDataSource(
+    this._ws,
+    this._signalBus, {
+    bool useTestData = false,
+  }) : _useTestData = useTestData {
+    _startPerformanceMonitoring();
+  }
+
+  /// 🆕 브로드캐스트 스트림 제공 - 여러 Repository가 구독 가능
+  Stream<Trade> watch(List<String> markets) {
+    if (_useTestData) return _testStream();
+
+    // dispose 후 재사용 가능하도록 초기화
+    if (_disposed) {
+      debugPrint('TradeRemoteDataSource: resetting after dispose');
+      _disposed = false;
+    }
+
+    // 🆕 동일한 마켓이면 기존 스트림 재사용
+    if (_masterController != null && 
+        _currentMarkets != null && 
+        _marketsEqual(_currentMarkets!, markets)) {
+      debugPrint('TradeRemoteDataSource: reusing existing broadcast stream for ${markets.length} markets');
+      return _masterController!.stream;
+    }
+
+    // 🆕 새로운 마켓이면 기존 스트림 정리하고 새로 생성
+    _cleanupMasterStream();
+    _initializeMasterStream(markets);
+
+    return _masterController!.stream;
+  }
+
+  /// 🆕 마스터 브로드캐스트 스트림 초기화
+  void _initializeMasterStream(List<String> markets) {
+    debugPrint('TradeRemoteDataSource: initializing master broadcast stream for ${markets.length} markets');
+    
+    _currentMarkets = List<String>.from(markets);
+    
+    _masterController = StreamController<Trade>.broadcast(
+      onListen: () {
+        _subscriberCount++;
+        debugPrint('TradeRemoteDataSource: subscriber added (total: $_subscriberCount)');
+        
+        // 첫 번째 구독자일 때만 WebSocket 시작
+        if (_subscriberCount == 1 && !_disposed) {
+          _startWebSocket(markets);
+        }
+      },
+      onCancel: () {
+        _subscriberCount--;
+        debugPrint('TradeRemoteDataSource: subscriber removed (remaining: $_subscriberCount)');
+        
+        // 모든 구독자가 떠나면 WebSocket 정리 (5초 지연)
+        if (_subscriberCount <= 0) {
+          Timer(const Duration(seconds: 5), () {
+            if (_subscriberCount <= 0 && !_disposed) {
+              debugPrint('TradeRemoteDataSource: no subscribers, cleaning up WebSocket');
+              _cleanupWebSocket();
+            }
+          });
+        }
+      },
+    );
+  }
+
+  /// 🆕 WebSocket 연결 시작
+  void _startWebSocket(List<String> markets) {
+    if (_disposed) return;
+
+    try {
+      debugPrint('TradeRemoteDataSource: starting WebSocket for ${markets.length} markets');
+      
+      _ws.connect(markets);
+      
+      // ✅ 단순화: Trade 스트림을 직접 구독
+      _wsSub = _ws.stream.listen(
+        (trade) {
+          // controller가 닫혔거나 disposed면 처리 안함
+          if (_disposed || _masterController == null || _masterController!.isClosed) {
+            debugPrint('TradeRemoteDataSource: skipping data - disposed or closed');
+            return;
+          }
+
+          // ✅ 데이터 검증 추가
+          if (!trade.isValidData) {
+            debugPrint('TradeRemoteDataSource: invalid trade data for ${trade.market}');
+            return;
+          }
+
+          // 🎯 성능 카운터 업데이트
+          _messageCount++;
+          _lastMessageTime = DateTime.now();
+
+          // 🆕 마스터 컨트롤러에 브로드캐스트
+          if (!_disposed && _masterController != null && !_masterController!.isClosed) {
+            _masterController!.add(trade);
+          }
+
+          // 🎯 스트림 타입별 이벤트 발생 (SignalBus 활용)
+          _fireSignalBusEvent(trade);
+        },
+        onError: (error, stackTrace) {
+          debugPrint('WebSocket error: $error');
+          // ✅ 에러 시 폴백 스트림으로 전환
+          if (!_disposed && _masterController != null && !_masterController!.isClosed) {
+            debugPrint('TradeRemoteDataSource: switching to fallback stream');
+            _masterController!.addStream(_testStream());
+          }
+        },
+        onDone: () {
+          debugPrint('WebSocket done - connection closed');
+          // ✅ 연결 종료 시 폴백 스트림으로 전환
+          if (!_disposed && _masterController != null && !_masterController!.isClosed) {
+            debugPrint('TradeRemoteDataSource: switching to fallback stream');
+            _masterController!.addStream(_testStream());
+          }
+        },
+        cancelOnError: false, // 에러가 나도 스트림 유지
+      );
+      
+      debugPrint('TradeRemoteDataSource: WebSocket stream subscription established');
+      
+    } catch (e, st) {
+      debugPrint('WS connection failed: $e');
+      debugPrint('Stack trace: $st');
+      
+      // ✅ 연결 실패 시 즉시 폴백 스트림으로 전환
+      if (!_disposed && _masterController != null && !_masterController!.isClosed) {
+        debugPrint('TradeRemoteDataSource: connection failed, using fallback stream');
+        _masterController!.addStream(_testStream());
+      }
+    }
+  }
+
+  /// 🎯 스트림 타입별 SignalBus 이벤트 발생
+  void _fireSignalBusEvent(Trade trade) {
+    try {
+      // Trade 객체를 JSON으로 변환
+      final tradeData = trade.toDebugMap();
+      
+      // 스트림 타입별로 다른 이벤트 발생
+      switch (trade.streamType) {
+        case BinanceStreamType.aggTrade:
+          _signalBus.fireAggTrade(tradeData);
+          break;
+        case BinanceStreamType.ticker:
+          _signalBus.fireTicker(tradeData);
+          break;
+        case BinanceStreamType.bookTicker:
+          _signalBus.fireBookTicker(tradeData);
+          break;
+        case BinanceStreamType.depth5:
+          _signalBus.fireDepth5(tradeData);
+          break;
+      }
+      
+      // ✅ 기존 호환성을 위한 일반 trade 이벤트도 발생
+      final appEvent = AppEvent.now(tradeData);
+      _signalBus.fireTradeEvent(appEvent);
+      
+    } catch (e) {
+      debugPrint('SignalBus event firing failed: $e');
+    }
+  }
+
+  /// 🆕 WebSocket만 정리 (컨트롤러는 유지)
+  void _cleanupWebSocket() {
+    debugPrint('TradeRemoteDataSource: cleaning up WebSocket');
+    _wsSub?.cancel();
+    _wsSub = null;
+  }
+
+  /// 🆕 마스터 스트림 완전 정리
+  void _cleanupMasterStream() {
+    debugPrint('TradeRemoteDataSource: cleaning up master stream');
+    
+    _cleanupWebSocket();
+    
+    if (_masterController != null && !_masterController!.isClosed) {
+      _masterController!.close();
+    }
+    _masterController = null;
+    _currentMarkets = null;
+    _subscriberCount = 0;
+  }
+
+  /// 🆕 마켓 리스트 비교 헬퍼
+  bool _marketsEqual(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    final setA = Set<String>.from(a);
+    final setB = Set<String>.from(b);
+    return setA.containsAll(setB) && setB.containsAll(setA);
+  }
+
+  /// 📊 성능 모니터링 시작
+  void _startPerformanceMonitoring() {
+    _performanceTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (_messageCount > 0) {
+        final rate = _messageCount / 10; // 초당 메시지 수
+        debugPrint('TradeRemoteDataSource: ${rate.toStringAsFixed(1)} msg/sec, '
+                  'subscribers: $_subscriberCount, '
+                  'last: ${_lastMessageTime?.toString() ?? "none"}');
+        _messageCount = 0; // 카운터 리셋
+      }
+    });
+  }
+
+  /// 🎯 개선된 테스트 스트림 (바이낸스 형식)
+  Stream<Trade> _testStream() async* {
+    final rnd = Random();
+    const symbols = [
+      'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT',
+      'XRPUSDT', 'DOTUSDT', 'LINKUSDT', 'LTCUSDT', 'MATICUSDT',
+    ];
+
+    const streamTypes = BinanceStreamType.values;
+
+    while (!_disposed) {
+      await Future.delayed(const Duration(milliseconds: 200)); // 5msg/sec
+      if (_disposed) break;
+      
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final symbol = symbols[rnd.nextInt(symbols.length)];
+      final streamType = streamTypes[rnd.nextInt(streamTypes.length)];
+      final basePrice = 50000.0 + rnd.nextDouble() * 10000; // 50k-60k 범위
+      
+      // ✅ 스트림 타입별로 다른 테스트 데이터 생성
+      late Map<String, dynamic> testData;
+      
+      switch (streamType) {
+        case BinanceStreamType.aggTrade:
+          testData = {
+            'e': 'aggTrade',
+            's': symbol,
+            'p': basePrice.toStringAsFixed(2),
+            'q': (rnd.nextDouble() * 10).toStringAsFixed(4),
+            'T': nowMs,
+            'a': rnd.nextInt(1000000),
+            'm': rnd.nextBool(),
+          };
+          break;
+        case BinanceStreamType.ticker:
+          testData = {
+            'e': '24hrTicker',
+            's': symbol,
+            'c': basePrice.toStringAsFixed(2),
+            'P': (rnd.nextDouble() * 10 - 5).toStringAsFixed(2), // -5% ~ +5%
+            'h': (basePrice * 1.1).toStringAsFixed(2),
+            'l': (basePrice * 0.9).toStringAsFixed(2),
+            'v': (rnd.nextDouble() * 1000).toStringAsFixed(2),
+            'q': (rnd.nextDouble() * 50000000).toStringAsFixed(2),
+            'E': nowMs,
+          };
+          break;
+        case BinanceStreamType.bookTicker:
+          testData = {
+            's': symbol,
+            'b': (basePrice * 0.999).toStringAsFixed(2),
+            'a': (basePrice * 1.001).toStringAsFixed(2),
+            'B': (rnd.nextDouble() * 100).toStringAsFixed(4),
+            'A': (rnd.nextDouble() * 100).toStringAsFixed(4),
+            'u': rnd.nextInt(1000000),
+          };
+          break;
+        case BinanceStreamType.depth5:
+          testData = {
+            'bids': [
+              [(basePrice * 0.999).toStringAsFixed(2), (rnd.nextDouble() * 100).toStringAsFixed(4)],
+              [(basePrice * 0.998).toStringAsFixed(2), (rnd.nextDouble() * 100).toStringAsFixed(4)],
+            ],
+            'asks': [
+              [(basePrice * 1.001).toStringAsFixed(2), (rnd.nextDouble() * 100).toStringAsFixed(4)],
+              [(basePrice * 1.002).toStringAsFixed(2), (rnd.nextDouble() * 100).toStringAsFixed(4)],
+            ],
+            'lastUpdateId': rnd.nextInt(1000000),
+          };
+          break;
+      }
+      
+      try {
+        final trade = Trade.fromBinanceStream(
+          json: testData, 
+          streamType: streamType,
+          symbol: symbol,
+        );
+        
+        yield trade;
+        
+        // 테스트 데이터도 SignalBus에 발생
+        _fireSignalBusEvent(trade);
+        
+      } catch (e) {
+        debugPrint('Test data creation failed: $e');
+      }
+    }
+  }
+
+  /// 📊 현재 상태 정보
+  Map<String, dynamic> getStatus() {
+    return {
+      'isDisposed': _disposed,
+      'subscriberCount': _subscriberCount,
+      'currentMarkets': _currentMarkets?.length ?? 0,
+      'hasMasterController': _masterController != null,
+      'hasWebSocketSub': _wsSub != null,
+      'messageCount': _messageCount,
+      'lastMessageTime': _lastMessageTime?.toIso8601String(),
+      'useTestData': _useTestData,
+    };
+  }
+
+  /// Clean up resources when no longer needed.
+  Future<void> dispose() async {
+    if (_disposed) return;
+    
+    _disposed = true;
+    
+    debugPrint('TradeRemoteDataSource: disposing...');
+    
+    // 성능 모니터링 타이머 정리
+    _performanceTimer?.cancel();
+    
+    // 모든 리소스 정리
+    _cleanupMasterStream();
+    
+    debugPrint('TradeRemoteDataSource: disposed');
+    
+    // WebSocket 클라이언트는 공유 리소스이므로 dispose하지 않음
   }
 }\n\n// ====== lib/data/repositories/trade_repository_impl.dart ======\n
 // lib/data/repositories/trade_repository_impl.dart
 
 import 'dart:async';
 import 'dart:collection';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/foundation.dart';
+import '../../core/config/app_config.dart';
 import '../../core/common/time_frame_types.dart';
 import '../../domain/entities/trade.dart';
 import '../../domain/repositories/trade_repository.dart';
@@ -162,242 +1941,978 @@ import '../datasources/trade_remote_ds.dart';
 import '../processors/trade_aggregator.dart';
 import '../../core/utils/logger.dart';
 
+/// 🎯 바이낸스 전용 효율적인 거래 Repository (업비트 스타일 개선)
+/// - 마스터 스트림으로 단일 소스 관리
+/// - 멀티 스트림 타입 지원 (aggTrade, ticker, bookTicker, depth5)
+/// - 스마트 배치 처리로 UI 성능 최적화
+/// - 메모리 효율적인 필터링 시스템
 class TradeRepositoryImpl implements TradeRepository {
   final TradeRemoteDataSource _remoteDataSource;
   final TradeAggregator _aggregator;
-  
-  // 데이터 스트림 컨트롤러
-  final _filteredTradesController = StreamController<List<Trade>>.broadcast();
-  
-  // 내부 상태
-  StreamSubscription? _rawTradeSub;
-  StreamSubscription? _aggregatedTradeSub;
-  double _currentThreshold = TradeFilter.usdt50k.value; // 기본 임계값
+
+  // 🎯 마스터 스트림 관리 (업비트 스타일)
+  Stream<Trade>? _masterStream;
+  StreamSubscription<Trade>? _masterSubscription;
+  bool _isInitialized = false;
+  List<String>? _currentMarkets;
+
+  // 📊 필터링 시스템
   final Map<TradeFilter, List<Trade>> _filterCache = {
     for (var filter in TradeFilter.values) filter: []
   };
-  final _seenIds = LinkedHashSet<String>();
+  double _currentThreshold = TradeFilter.usdt50k.value;
+
+  // 🎯 스트림 컨트롤러들
+  final StreamController<List<Trade>> _filteredTradesController = 
+      StreamController<List<Trade>>.broadcast();
+  final StreamController<Trade> _aggregatedController = 
+      StreamController<Trade>.broadcast();
+
+  // 🧹 메모리 관리
+  final LinkedHashSet<String> _seenIds = LinkedHashSet<String>();
   Timer? _batchUpdateTimer;
-  bool _isInitialized = false;
+  Timer? _memoryCleanupTimer;
 
-  TradeRepositoryImpl(this._remoteDataSource) : _aggregator = TradeAggregator();
+  // 📈 성능 모니터링
+  int _processedCount = 0;
+  int _filteredCount = 0;
+  DateTime? _lastUpdateTime;
 
-  void _initialize(List<String> markets) {
-    if (_isInitialized) return;
+  // 성능 최적화 상수
+  static const int _maxTradesPerFilter = 100;
+  static const int _maxSeenIdsCache = 5000;
+  static const Duration _batchUpdateInterval = Duration(milliseconds: 100);
+  static const Duration _memoryCleanupInterval = Duration(seconds: 30);
+
+  TradeRepositoryImpl(this._remoteDataSource) : _aggregator = TradeAggregator() {
+    _startMemoryCleanup();
+    log.i('[TradeRepository] Initialized');
+  }
+
+  /// 🔥 핵심: 마스터 스트림 초기화 (한 번만 실행)
+  void _initializeMasterStream(List<String> markets) {
+    if (_isInitialized && _marketsEqual(_currentMarkets, markets)) {
+      return; // 이미 같은 마켓으로 초기화됨
+    }
+
+    log.i('[TradeRepository] Initializing master stream for ${markets.length} markets');
+    
+    // 기존 스트림 정리
+    _cleanupMasterStream();
+    
+    _currentMarkets = List<String>.from(markets);
     _isInitialized = true;
 
-    // 1. 원격 데이터 소스의 스트림을 구독
-    final rawTradeStream = _remoteDataSource.watchTrades(markets);
-    _rawTradeSub = rawTradeStream.listen(_processRawTrade);
-
-    // 2. 집계기(Aggregator)의 스트림을 구독
-    _aggregatedTradeSub = _aggregator.stream.listen(_handleAggregatedTrade);
+    // ✅ 브로드캐스트 스트림 생성 (TradeRemoteDataSource의 watch 사용)
+    _masterStream = _remoteDataSource.watch(markets);
     
-    log.i('[Repository] Initialized with ${markets.length} markets.');
+    // ✅ 단일 구독으로 모든 데이터 처리
+    _masterSubscription = _masterStream!.listen(
+      _processRawTrade,
+      onError: (error, stackTrace) {
+        log.e('[TradeRepository] Master stream error', error, stackTrace);
+      },
+      onDone: () {
+        log.w('[TradeRepository] Master stream done');
+      },
+      cancelOnError: false,
+    );
+
+    // ✅ Aggregator 스트림 구독
+    _aggregator.stream.listen(
+      _handleAggregatedTrade,
+      onError: (error, stackTrace) {
+        log.e('[TradeRepository] Aggregator stream error', error, stackTrace);
+      },
+      cancelOnError: false,
+    );
+
+    log.i('[TradeRepository] Master stream initialized successfully');
   }
 
-  /// 1. 원시 데이터 처리: 중복 확인 후 집계기로 전달
-  void _processRawTrade(Trade trade) {
-    if (!_seenIds.add(trade.tradeId)) return;
-    if (_seenIds.length > TradeConfig.maxSeenIdsCacheSize) {
-      _seenIds.remove(_seenIds.first);
+  /// 📥 원시 거래 데이터 처리 (스트림별 분기)
+void _processRawTrade(Trade trade) {
+  try {
+    // ✅ 데이터 검증
+    if (!trade.isValidData) {
+      log.w('[TradeRepository] Invalid trade data: ${trade.market}');
+      return;
     }
-    _aggregator.process(trade);
-  }
 
-  /// 2. 집계된 데이터 처리: 필터별 캐시에 저장
-  void _handleAggregatedTrade(Trade trade) {
-    for (final filter in TradeFilter.values) {
-      if (trade.totalValue >= filter.value) {
-        final list = _filterCache[filter]!;
-        list.insert(0, trade);
-        if (list.length > TradeConfig.maxTradesPerFilter) {
-          list.removeLast();
+    // ✅ 중복 처리 방지
+    if (!_seenIds.add(trade.tradeId)) {
+      return;
+    }
+
+    _processedCount++;
+    _lastUpdateTime = DateTime.now();
+
+    // ✅ [핵심] 스트림 타입별 처리 전략
+    switch (trade.streamType) {
+      case BinanceStreamType.aggTrade:
+        // aggTrade만 집계기로 전달 (실제 거래 데이터)
+        _aggregator.process(trade);
+        break;
+        
+      case BinanceStreamType.ticker:
+        // 🚨 ticker는 트레이드라인에서 제외! (24시간 누적 데이터)
+        // _handleAggregatedTrade(trade); ← 이거 주석처리!
+        return;
+        
+      case BinanceStreamType.bookTicker:
+      case BinanceStreamType.depth5:
+        // 호가 데이터는 별도 스트림으로 처리 (필터링 제외)
+        if (!_aggregatedController.isClosed) {
+          _aggregatedController.add(trade);
         }
-      }
+        break;
     }
-    // UI 업데이트는 바로 하지 않고, 배치 스케줄링
-    _scheduleBatchUpdate();
+
+  } catch (e, st) {
+    log.e('[TradeRepository] Raw trade processing error', e, st);
   }
-  
-  /// 3. 배치 업데이트 스케줄링: 100ms 이내의 변경사항은 한 번에 모아서 UI 업데이트
+}
+
+  /// 🎯 집계된 거래 처리: 필터별 캐시에 저장
+  void _handleAggregatedTrade(Trade trade) {
+    try {
+      // ✅ 집계된 거래 스트림에 추가
+      if (!_aggregatedController.isClosed) {
+        _aggregatedController.add(trade);
+      }
+
+      // ✅ [개선] aggTrade와 ticker만 필터링 대상
+      if (trade.streamType == BinanceStreamType.aggTrade || 
+          trade.streamType == BinanceStreamType.ticker) {
+        
+        // 각 필터에 해당하는 거래 추가
+        for (final filter in TradeFilter.values) {
+          if (trade.totalValue >= filter.value) {
+            final list = _filterCache[filter]!;
+            list.insert(0, trade);
+            
+            // 최대 거래 수 유지
+            if (list.length > _maxTradesPerFilter) {
+              list.removeLast();
+            }
+          }
+        }
+
+        _filteredCount++;
+        
+        // 🚀 배치 업데이트 스케줄링 (과도한 UI 업데이트 방지)
+        _scheduleBatchUpdate();
+      }
+
+    } catch (e, st) {
+      log.e('[TradeRepository] Aggregated trade handling error', e, st);
+    }
+  }
+
+  /// ⏰ 배치 업데이트 스케줄링 (업비트 스타일)
   void _scheduleBatchUpdate() {
+    // 이미 스케줄된 업데이트가 있으면 취소하고 새로 스케줄
     _batchUpdateTimer?.cancel();
-    _batchUpdateTimer = Timer(const Duration(milliseconds: 100), _performBatchUpdate);
+    
+    _batchUpdateTimer = Timer(_batchUpdateInterval, () {
+      _performBatchUpdate();
+    });
   }
-  
-  /// 4. 실제 UI 업데이트 수행: 현재 임계값에 맞는 최종 리스트를 스트림에 전달
+
+  /// 📊 실제 UI 업데이트 수행
   void _performBatchUpdate() {
-    final list = _filterCache[
-      TradeFilter.values.firstWhere(
+    try {
+      // 현재 임계값에 해당하는 필터 찾기
+      final targetFilter = TradeFilter.values.firstWhere(
         (f) => f.value == _currentThreshold,
         orElse: () => TradeFilter.usdt50k,
-      )
-    ] ?? [];
+      );
+
+      final filteredList = _filterCache[targetFilter] ?? <Trade>[];
+      
+      // 🚀 UI에 업데이트 전송
+      if (!_filteredTradesController.isClosed) {
+        _filteredTradesController.add(List<Trade>.from(filteredList));
+        
+        if (kDebugMode && filteredList.isNotEmpty) {
+          log.d('[TradeRepository] Batch update: ${filteredList.length} filtered trades '
+                '(threshold: ${_currentThreshold.toStringAsFixed(0)})');
+        }
+      }
+
+    } catch (e, st) {
+      log.e('[TradeRepository] Batch update error', e, st);
+    }
+  }
+
+  /// 🧹 메모리 정리 시작
+  void _startMemoryCleanup() {
+    _memoryCleanupTimer = Timer.periodic(_memoryCleanupInterval, (_) {
+      _cleanupMemory();
+    });
+  }
+
+  /// 🧹 메모리 정리 수행
+  void _cleanupMemory() {
+    try {
+      // SeenIds 캐시 크기 제한
+      if (_seenIds.length > _maxSeenIdsCache) {
+        final removeCount = (_seenIds.length * 0.3).ceil(); // 30% 제거
+        final toRemove = _seenIds.take(removeCount).toList();
+        _seenIds.removeAll(toRemove);
+        
+        if (kDebugMode) {
+          log.d('[TradeRepository] Memory cleanup: removed $removeCount seen IDs');
+        }
+      }
+
+      // 필터 캐시 정리 (각 필터당 최대 크기 재확인)
+      for (final entry in _filterCache.entries) {
+        final list = entry.value;
+        if (list.length > _maxTradesPerFilter) {
+          final excess = list.length - _maxTradesPerFilter;
+          list.removeRange(_maxTradesPerFilter, list.length);
+          
+          if (kDebugMode) {
+            log.d('[TradeRepository] Filter cache cleanup: removed $excess trades from ${entry.key}');
+          }
+        }
+      }
+
+    } catch (e, st) {
+      log.e('[TradeRepository] Memory cleanup error', e, st);
+    }
+  }
+
+  /// 🔄 마스터 스트림 정리
+  void _cleanupMasterStream() {
+    _masterSubscription?.cancel();
+    _masterSubscription = null;
+    _masterStream = null;
+    _isInitialized = false;
+  }
+
+  /// 🔍 마켓 리스트 비교
+  bool _marketsEqual(List<String>? a, List<String>? b) {
+    if (a == null || b == null) return false;
+    if (a.length != b.length) return false;
+    return Set<String>.from(a).containsAll(b);
+  }
+
+  // ===================================================================
+  // TradeRepository 인터페이스 구현
+  // ===================================================================
+
+  @override
+  Stream<Trade> watchTrades(List<String> markets) {
+    log.d('[TradeRepository] watchTrades() called with ${markets.length} markets');
     
-    _filteredTradesController.add(List.from(list));
+    _initializeMasterStream(markets);
+    
+    // 마스터 스트림 반환 (모든 스트림 타입 포함)
+    return _masterStream!;
   }
 
   @override
-  Stream<List<Trade>> watchFilteredTrades(List<String> markets) {
-    _initialize(markets);
+  Stream<List<Trade>> watchFilteredTrades(double threshold, List<String> markets) {
+    log.d('[TradeRepository] watchFilteredTrades() called with threshold: $threshold');
+    
+    // 임계값 업데이트
+    _currentThreshold = threshold;
+    
+    // 마스터 스트림 초기화
+    _initializeMasterStream(markets);
+    
+    // 임계값 변경으로 인한 즉시 재필터링
+    _scheduleBatchUpdate();
+    
+    // 필터링된 거래 스트림 반환
     return _filteredTradesController.stream;
   }
 
   @override
-  Stream<Trade> watchAggregatedTrades(List<String> markets) {
-    _initialize(markets);
-    return _aggregator.stream;
-  }
-  
-  @override
-  void updateThreshold(double threshold) {
-    if (_currentThreshold == threshold) return;
-    _currentThreshold = threshold;
-    log.d('[Repository] Threshold updated to: $threshold');
-    // 임계값 변경 시 즉시 UI 업데이트 수행
-    _performBatchUpdate();
+  Stream<Trade> watchAggregatedTrades() {
+    log.d('[TradeRepository] watchAggregatedTrades() called');
+    
+    // 집계된 거래 스트림 반환 (모든 스트림 타입 포함)
+    return _aggregatedController.stream;
   }
 
   @override
-  void dispose() {
-    _rawTradeSub?.cancel();
-    _aggregatedTradeSub?.cancel();
+  void updateThreshold(double threshold) {
+    if (_currentThreshold == threshold) return;
+    
+    final oldThreshold = _currentThreshold;
+    _currentThreshold = threshold;
+    
+    log.i('[TradeRepository] Threshold updated: ${oldThreshold.toStringAsFixed(0)} → ${threshold.toStringAsFixed(0)}');
+    
+    // 임계값 변경 시 즉시 UI 업데이트
+    _performBatchUpdate();
+  }
+
+  /// ✅ [추가] 현재 상태 조회
+  Map<String, dynamic> getStatus() {
+    return {
+      'isInitialized': _isInitialized,
+      'currentMarkets': _currentMarkets?.length ?? 0,
+      'currentThreshold': _currentThreshold,
+      'processedCount': _processedCount,
+      'filteredCount': _filteredCount,
+      'seenIdsCount': _seenIds.length,
+      'filterCacheSize': _filterCache.values.map((list) => list.length).reduce((a, b) => a + b),
+      'lastUpdateTime': _lastUpdateTime?.toIso8601String(),
+    };
+  }
+
+  /// ✅ [추가] 특정 필터의 거래 수 조회
+  int getTradeCountForFilter(TradeFilter filter) {
+    return _filterCache[filter]?.length ?? 0;
+  }
+
+  @override
+  Future<void> dispose() async {
+    log.i('[TradeRepository] Disposing... Status: ${getStatus()}');
+    
+    // 타이머들 정리
     _batchUpdateTimer?.cancel();
+    _memoryCleanupTimer?.cancel();
+    
+    // 마스터 스트림 정리
+    _cleanupMasterStream();
+    
+    // Aggregator 정리
     _aggregator.dispose();
-    _filteredTradesController.close();
-    _isInitialized = false;
-    log.i('[Repository] Disposed.');
+    
+    // 컨트롤러들 정리
+    await _filteredTradesController.close();
+    await _aggregatedController.close();
+    
+    // 메모리 정리
+    _filterCache.clear();
+    _seenIds.clear();
+    _currentMarkets = null;
+    
+    log.i('[TradeRepository] Disposed successfully');
   }
 }\n\n// ====== lib/data/processors/trade_aggregator.dart ======\n
 // lib/data/processors/trade_aggregator.dart
 
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import '../../domain/entities/trade.dart';
+import '../../core/config/app_config.dart';
 import '../../core/utils/logger.dart';
 
-/// 실시간 거래를 병합하여 UI 업데이트 빈도를 조절하는 거래 집계기
+/// 🎯 바이낸스 전용 실시간 거래 집계기 (업비트 스타일 개선)
+/// - 멀티 스트림 지원 (aggTrade, ticker, bookTicker, depth5)
+/// - 스트림별 다른 병합 전략 적용
+/// - 가중 평균 가격 계산으로 정확도 향상
+/// - 에러 처리 및 성능 모니터링 추가
 class TradeAggregator {
   final Map<String, Trade> _pendingTrades = {};
-  final _controller = StreamController<Trade>.broadcast();
+  final StreamController<Trade> _controller = StreamController<Trade>.broadcast();
   Timer? _flushTimer;
+  
+  // 📊 성능 모니터링
+  int _processedCount = 0;
+  int _mergedCount = 0;
+  int _flushedCount = 0;
+  DateTime? _lastActivityTime;
 
   /// 집계 처리된 거래 데이터 스트림
   Stream<Trade> get stream => _controller.stream;
 
+  /// 스트림별 병합 창 설정 (밀리초)
+  int get mergeWindowMs => AppConfig.mergeWindowMs;
+
   TradeAggregator() {
-    // 1초마다 대기 중인 거래들을 방출(flush)하여 항상 최신 데이터가 반영되도록 함
-    _flushTimer = Timer.periodic(const Duration(seconds: 1), (_) => _flush());
+    // ✅ [개선] AppConfig 기반 flush 주기 설정
+    final flushInterval = Duration(milliseconds: AppConfig.aggregatorFlushIntervalMs);
+    _flushTimer = Timer.periodic(flushInterval, (_) => _flush());
+    log.i('[TradeAggregator] Initialized with ${mergeWindowMs}ms merge window, '
+          '${AppConfig.aggregatorFlushIntervalMs}ms flush interval');
   }
 
-  /// 새로운 거래를 받아 집계 로직 처리
+  /// 🎯 새로운 거래를 받아 스트림별 집계 로직 처리
   void process(Trade trade) {
+    try {
+      // ✅ [추가] 데이터 검증
+      if (!trade.isValidData) {
+        if (kDebugMode) {
+          log.w('[TradeAggregator] Invalid trade data: ${trade.market}');
+        }
+        return;
+      }
+
+      _processedCount++;
+      _lastActivityTime = DateTime.now();
+
+      // ✅ [개선] AppConfig 기반 스트림별 처리 분기
+      final shouldProcessImmediately = AppConfig.shouldProcessImmediately(trade.streamType.name);
+      final streamMergeWindow = AppConfig.getMergeWindowForStream(trade.streamType.name);
+
+      switch (trade.streamType) {
+        case BinanceStreamType.aggTrade:
+          _processAggTrade(trade, streamMergeWindow);
+          break;
+        case BinanceStreamType.ticker:
+          _processTicker(trade, shouldProcessImmediately);
+          break;
+        case BinanceStreamType.bookTicker:
+          _processBookTicker(trade, shouldProcessImmediately);
+          break;
+        case BinanceStreamType.depth5:
+          _processDepth5(trade, shouldProcessImmediately);
+          break;
+      }
+
+    } catch (e, st) {
+      log.e('[TradeAggregator] Process error for ${trade.market}', e, st);
+    }
+  }
+
+  /// ✅ [신규] aggTrade 전용 처리 (거래량 가중 평균)
+  void _processAggTrade(Trade trade, int mergeWindow) {
     final existing = _pendingTrades[trade.market];
 
-    // 해당 마켓에 대기 중인 거래가 없다면 새로 추가
+    // 해당 마켓에 대기 중인 거래가 없다면 새로 추가하고 즉시 방출
     if (existing == null) {
       _pendingTrades[trade.market] = trade;
+      _controller.add(trade); // ✅ [개선] 첫 거래 즉시 반영
+      if (kDebugMode) {
+        log.d('[TradeAggregator] New aggTrade: ${trade.market} ${trade.price} × ${trade.quantity}');
+      }
       return;
     }
 
-    // 시간 창(500ms) 내의 거래라면 병합
-    if (trade.timestamp - existing.timestamp <= 500) {
-      final newQuantity = existing.quantity + trade.quantity;
-      _pendingTrades[trade.market] = Trade(
-        market: trade.market,
-        price: trade.price, // 가격은 최신 거래의 것을 따름
-        quantity: newQuantity,
-        totalValue: existing.totalValue + trade.totalValue,
-        isBuy: trade.isBuy, // 방향도 최신 거래의 것을 따름
-        timestamp: trade.timestamp,
-        tradeId: trade.tradeId,
+    // ✅ [개선] 같은 스트림 타입만 병합
+    if (existing.streamType != BinanceStreamType.aggTrade) {
+      _pendingTrades[trade.market] = trade;
+      _controller.add(trade);
+      return;
+    }
+
+    // 시간 창 내의 거래라면 가중 평균으로 병합
+    if (trade.timestamp - existing.timestamp <= mergeWindow) {
+      final totalQuantity = existing.quantity + trade.quantity;
+      final totalValue = existing.totalValue + trade.totalValue;
+      
+      // ✅ [핵심] AppConfig 설정 기반 가격 계산
+      final newPrice = AppConfig.useWeightedAverage() 
+          ? totalValue / totalQuantity  // 가중 평균
+          : trade.price;                // 최신 가격
+
+      final mergedTrade = trade.copyWith(
+        price: newPrice,
+        quantity: totalQuantity,
+        totalValue: totalValue,
+        timestamp: trade.timestamp, // 최신 시간 사용
       );
+
+      _pendingTrades[trade.market] = mergedTrade;
+      _mergedCount++;
+
+      if (kDebugMode && AppConfig.enableMergeLogging) {
+        log.d('[TradeAggregator] Merged aggTrade: ${trade.market} '
+              'price: ${newPrice.toStringAsFixed(2)}, '
+              'total: ${totalQuantity.toStringAsFixed(4)}');
+      }
     } else {
       // 시간 창을 벗어나면, 기존 거래는 방출하고 새 거래를 대기
       _controller.add(existing);
       _pendingTrades[trade.market] = trade;
+      _controller.add(trade); // 새 거래도 즉시 방출
     }
   }
 
-  /// 대기 중인 모든 거래를 방출
-  void _flush() {
-    if (_pendingTrades.isEmpty) return;
-    _pendingTrades.values.forEach(_controller.add);
-    _pendingTrades.clear();
+  /// ✅ [신규] ticker 전용 처리 (최신값 우선)
+  void _processTicker(Trade trade, bool processImmediately) {
+    final existing = _pendingTrades[trade.market];
+
+    // ✅ [개선] AppConfig 설정에 따라 즉시 처리 또는 병합
+    if (processImmediately || existing == null || existing.streamType != BinanceStreamType.ticker) {
+      _pendingTrades[trade.market] = trade;
+      _controller.add(trade);
+      return;
+    }
+
+    // 짧은 시간 내 연속 ticker는 마지막 것만 유지 (throttling 효과)
+    if (trade.timestamp - existing.timestamp <= 1000) { // 1초 내
+      _pendingTrades[trade.market] = trade; // 덮어쓰기
+    } else {
+      _controller.add(existing); // 기존 것 방출
+      _pendingTrades[trade.market] = trade;
+      _controller.add(trade); // 새 것도 방출
+    }
   }
 
+  /// ✅ [신규] bookTicker 전용 처리 (스프레드 중심)
+  void _processBookTicker(Trade trade, bool processImmediately) {
+    // ✅ [개선] AppConfig 설정 기반 처리
+    _pendingTrades[trade.market] = trade;
+    if (processImmediately) {
+      _controller.add(trade);
+    }
+    
+    if (kDebugMode && AppConfig.enableMergeLogging) {
+      final spread = trade.spread;
+      log.d('[TradeAggregator] BookTicker: ${trade.market} '
+            'spread: ${spread?.toStringAsFixed(4) ?? "N/A"}');
+    }
+  }
+
+  /// ✅ [신규] depth5 전용 처리 (호가창 업데이트)
+  void _processDepth5(Trade trade, bool processImmediately) {
+    // ✅ [개선] AppConfig 설정 기반 처리
+    _pendingTrades[trade.market] = trade;
+    if (processImmediately) {
+      _controller.add(trade);
+    }
+    
+    if (kDebugMode && AppConfig.enableMergeLogging) {
+      log.d('[TradeAggregator] Depth5: ${trade.market} mid: ${trade.price.toStringAsFixed(2)}');
+    }
+  }
+
+  /// ✅ [개선] 대기 중인 모든 거래를 방출 (성능 향상)
+  void _flush() {
+    if (_pendingTrades.isEmpty) return;
+
+    try {
+      final trades = _pendingTrades.values.toList();
+      _flushedCount += trades.length;
+      
+      // ✅ [개선] 배치로 한번에 처리
+      for (final trade in trades) {
+        if (!_controller.isClosed) {
+          _controller.add(trade);
+        }
+      }
+      
+      _pendingTrades.clear();
+
+      if (kDebugMode && trades.isNotEmpty) {
+        log.d('[TradeAggregator] Flushed ${trades.length} pending trades');
+      }
+    } catch (e, st) {
+      log.e('[TradeAggregator] Flush error', e, st);
+    }
+  }
+
+  /// ✅ [추가] 모든 대기 거래를 즉시 방출 (수동 flush)
+  void flushAll() {
+    log.i('[TradeAggregator] Manual flush requested');
+    _flush();
+  }
+
+  /// ✅ [추가] 성능 통계 조회
+  Map<String, dynamic> getStats() {
+    return {
+      'processedCount': _processedCount,
+      'mergedCount': _mergedCount,
+      'flushedCount': _flushedCount,
+      'pendingTrades': _pendingTrades.length,
+      'mergeWindowMs': mergeWindowMs,
+      'lastActivityTime': _lastActivityTime?.toIso8601String(),
+      'isActive': _flushTimer?.isActive ?? false,
+    };
+  }
+
+  /// ✅ [추가] 특정 마켓의 대기 중인 거래 조회 (디버깅용)
+  Trade? getPendingTrade(String market) {
+    return _pendingTrades[market];
+  }
+
+  /// ✅ [추가] 현재 대기 중인 거래 수
+  int get pendingTradesCount => _pendingTrades.length;
+
+  /// ✅ [추가] 처리 통계 초기화 (테스트용)
+  void resetStats() {
+    _processedCount = 0;
+    _mergedCount = 0;
+    _flushedCount = 0;
+    _lastActivityTime = null;
+    log.i('[TradeAggregator] Stats reset');
+  }
+
+  /// ✅ [추가] 모든 대기 거래 클리어 (테스트/디버그용)
+  void clear() {
+    _pendingTrades.clear();
+    log.i('[TradeAggregator] All pending trades cleared');
+  }
+
+  /// 🧹 리소스 정리
   void dispose() {
+    log.i('[TradeAggregator] Disposing... Stats: ${getStats()}');
+    
+    // 마지막 flush
+    _flush();
+    
     _flushTimer?.cancel();
-    _controller.close();
-    log.i('[Aggregator] Disposed.');
+    _flushTimer = null;
+    
+    if (!_controller.isClosed) {
+      _controller.close();
+    }
+    
+    _pendingTrades.clear();
+    log.i('[TradeAggregator] Disposed');
   }
 }\n\n// ====== lib/domain/repositories/trade_repository.dart ======\n
 // lib/domain/repositories/trade_repository.dart
 
 import '../entities/trade.dart';
 
+/// 🎯 바이낸스 거래 데이터 Repository 인터페이스
+/// - 멀티 스트림 지원 (aggTrade, ticker, bookTicker, depth5)
+/// - 효율적인 필터링 및 집계 시스템
+/// - 실시간 임계값 업데이트 지원
 abstract class TradeRepository {
-  /// 필터링된 실시간 체결 리스트 스트림
-  Stream<List<Trade>> watchFilteredTrades(List<String> markets);
-
-  /// 집계 처리된 단일 체결 스트림
-  Stream<Trade> watchAggregatedTrades(List<String> markets);
-
-  /// 실시간으로 필터 임계값 업데이트
-  void updateThreshold(double threshold);
   
-  /// 리소스 정리
-  void dispose();
+  /// 🎯 원시 거래 스트림 제공
+  /// 모든 스트림 타입(aggTrade, ticker, bookTicker, depth5)을 포함한 실시간 데이터
+  /// 
+  /// [markets] 구독할 마켓 목록 (예: ['BTCUSDT', 'ETHUSDT'])
+  /// Returns: Trade 객체의 실시간 스트림
+  Stream<Trade> watchTrades(List<String> markets);
+
+  /// 📊 필터링된 거래 리스트 스트림
+  /// 지정된 임계값 이상의 거래만 필터링하여 리스트로 제공
+  /// 
+  /// [threshold] 최소 거래대금 임계값 (USDT 기준)
+  /// [markets] 구독할 마켓 목록
+  /// Returns: 필터링된 Trade 리스트의 실시간 스트림
+  Stream<List<Trade>> watchFilteredTrades(double threshold, List<String> markets);
+
+  /// 🔄 집계 처리된 거래 스트림
+  /// TradeAggregator를 통해 병합/집계된 거래 데이터 제공
+  /// 
+  /// Returns: 집계된 Trade 객체의 실시간 스트림
+  Stream<Trade> watchAggregatedTrades();
+
+  /// ⚙️ 실시간 필터 임계값 업데이트
+  /// UI에서 필터 값이 변경될 때 호출하여 즉시 필터링 결과 업데이트
+  /// 
+  /// [threshold] 새로운 임계값 (USDT 기준)
+  void updateThreshold(double threshold);
+
+  /// 🧹 리소스 정리
+  /// WebSocket 연결, 스트림 구독, 메모리 캐시 등 모든 리소스 해제
+  Future<void> dispose();
 }\n\n// ====== lib/domain/usecases/trade_usecase.dart ======\n
 // lib/domain/usecases/trade_usecase.dart
 
+import 'dart:async';
+import '../../core/error/app_exception.dart';
+import '../../core/extensions/result.dart';
+import '../../core/utils/logger.dart';
 import '../entities/trade.dart';
 import '../repositories/trade_repository.dart';
 
+/// 🎯 바이낸스 거래 관련 비즈니스 로직을 제공하는 UseCase
+/// - 멀티 스트림 지원 (aggTrade, ticker, bookTicker, depth5)
+/// - Result 패턴으로 타입 안전한 에러 처리
+/// - 스트림별 차별화된 비즈니스 로직 적용
+/// - 실시간 필터링 및 집계 기능
 class TradeUsecase {
   final TradeRepository _repository;
-
+  
+  // 📊 내부 상태 관리
+  double _currentThreshold = 50000.0; // 기본 임계값: 50K USDT
+  List<String> _currentMarkets = [];
+  
+  // 🔄 스트림 구독 관리
+  final Map<String, StreamSubscription> _activeSubscriptions = {};
+  
   TradeUsecase(this._repository);
 
-  Stream<List<Trade>> watchFilteredTrades(List<String> markets) {
-    return _repository.watchFilteredTrades(markets);
+  // ===================================================================
+  // 핵심 비즈니스 로직 메서드들
+  // ===================================================================
+
+  /// 🎯 원시 거래 스트림 (모든 스트림 타입 포함)
+  /// 실시간 거래 데이터를 Result 패턴으로 안전하게 제공
+  /// 
+  /// [markets] 구독할 마켓 목록
+  /// Returns: Result로 래핑된 Trade 스트림
+  Stream<Result<Trade, AppException>> watchRawTrades(List<String> markets) {
+    log.d('[TradeUsecase] Starting raw trades stream for ${markets.length} markets');
+    
+    _currentMarkets = List<String>.from(markets);
+    
+    return _repository
+        .watchTrades(markets)
+        .transform(_wrapStream<Trade>('Raw trades stream failed'));
   }
 
-  Stream<Trade> watchAggregatedTrades(List<String> markets) {
-    return _repository.watchAggregatedTrades(markets);
+  /// 📊 필터링된 거래 리스트 (비즈니스 로직 적용)
+  /// threshold와 markets를 기준으로 필터링된 거래 목록을 Result 패턴으로 제공
+  /// 
+  /// [threshold] 최소 거래대금 임계값 (USDT)
+  /// [markets] 구독할 마켓 목록  
+  /// Returns: Result로 래핑된 필터링된 Trade 리스트 스트림
+  Stream<Result<List<Trade>, AppException>> filterTrades(
+    double threshold,
+    List<String> markets,
+  ) {
+    log.i('[TradeUsecase] Starting filtered trades: threshold=${threshold.toStringAsFixed(0)}, markets=${markets.length}');
+    
+    // ✅ 비즈니스 로직: 임계값 검증
+    if (threshold < 0) {
+      return Stream.value(Err(AppException.business('Invalid threshold: $threshold. Must be >= 0')));
+    }
+    
+    if (markets.isEmpty) {
+      return Stream.value(Err(AppException.business('Markets list cannot be empty')));
+    }
+    
+    _currentThreshold = threshold;
+    _currentMarkets = List<String>.from(markets);
+    
+    return _repository
+        .watchFilteredTrades(threshold, markets)
+        .transform(_wrapStream<List<Trade>>('Filter trades failed'))
+        .map((result) => result.map(_applyBusinessLogicToList));
   }
-  
+
+  /// 🔄 집계된 거래 스트림 (스트림별 분리)
+  /// TradeAggregator를 통해 병합/집계된 거래 데이터를 Result 패턴으로 제공
+  /// 
+  /// Returns: Result로 래핑된 집계 Trade 스트림
+  Stream<Result<Trade, AppException>> aggregateTrades() {
+    log.d('[TradeUsecase] Starting aggregated trades stream');
+    
+    return _repository
+        .watchAggregatedTrades()
+        .transform(_wrapStream<Trade>('Aggregate trades failed'))
+        .map((result) => result.map(_applyBusinessLogicToTrade));
+  }
+
+  /// ✅ [추가] 스트림별 특화된 거래 스트림들
+
+  /// aggTrade만 필터링한 스트림
+  Stream<Result<Trade, AppException>> watchAggTrades(List<String> markets) {
+    return watchRawTrades(markets)
+        .map((result) => result.mapWhere(
+          (trade) => trade.streamType == BinanceStreamType.aggTrade,
+          fallback: () => Err(AppException.business('No aggTrade data available')),
+        ));
+  }
+
+  /// ticker만 필터링한 스트림  
+  Stream<Result<Trade, AppException>> watchTickers(List<String> markets) {
+    return watchRawTrades(markets)
+        .map((result) => result.mapWhere(
+          (trade) => trade.streamType == BinanceStreamType.ticker,
+          fallback: () => Err(AppException.business('No ticker data available')),
+        ));
+  }
+
+  /// bookTicker만 필터링한 스트림
+  Stream<Result<Trade, AppException>> watchBookTickers(List<String> markets) {
+    return watchRawTrades(markets)
+        .map((result) => result.mapWhere(
+          (trade) => trade.streamType == BinanceStreamType.bookTicker,
+          fallback: () => Err(AppException.business('No bookTicker data available')),
+        ));
+  }
+
+  // ===================================================================
+  // 비즈니스 로직 헬퍼 메서드들
+  // ===================================================================
+
+  /// 🎯 개별 거래에 비즈니스 로직 적용
+  Trade _applyBusinessLogicToTrade(Trade trade) {
+    // ✅ 비즈니스 로직 예시: 거래 검증 및 보강
+    
+    // 1. 데이터 검증
+    if (!trade.isValidData) {
+      log.w('[TradeUsecase] Invalid trade data detected: ${trade.market}');
+      return trade;
+    }
+    
+    // 2. 스트림별 추가 정보 계산
+    switch (trade.streamType) {
+      case BinanceStreamType.aggTrade:
+        // aggTrade: 거래 크기별 등급 분류 가능
+        break;
+      case BinanceStreamType.ticker:
+        // ticker: 변동률 기반 알림 로직 가능
+        break;
+      case BinanceStreamType.bookTicker:
+        // bookTicker: 스프레드 분석 로직 가능
+        break;
+      case BinanceStreamType.depth5:
+        // depth5: 호가 불균형 분석 가능
+        break;
+    }
+    
+    return trade;
+  }
+
+  /// 🎯 거래 리스트에 비즈니스 로직 적용
+  List<Trade> _applyBusinessLogicToList(List<Trade> trades) {
+    if (trades.isEmpty) return trades;
+    
+    // ✅ 비즈니스 로직 예시들:
+    
+    // 1. 데이터 품질 검증
+    final validTrades = trades.where((trade) => trade.isValidData).toList();
+    
+    // 2. 중복 제거 (tradeId 기준)
+    final seenIds = <String>{};
+    final uniqueTrades = validTrades.where((trade) => seenIds.add(trade.tradeId)).toList();
+    
+    // 3. 시간순 정렬 (최신 순)
+    uniqueTrades.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    
+    // 4. 임계값 재검증 (Repository 필터링 이후 추가 검증)
+    final reFilteredTrades = uniqueTrades
+        .where((trade) => trade.totalValue >= _currentThreshold)
+        .toList();
+    
+    log.d('[TradeUsecase] Business logic applied: ${trades.length} → ${reFilteredTrades.length} trades');
+    
+    return reFilteredTrades;
+  }
+
+  // ===================================================================
+  // 상태 관리 메서드들
+  // ===================================================================
+
+  /// ⚙️ 실시간 필터 임계값 업데이트
   void updateThreshold(double threshold) {
+    if (threshold < 0) {
+      log.w('[TradeUsecase] Invalid threshold: $threshold. Ignoring update.');
+      return;
+    }
+    
+    if (_currentThreshold == threshold) {
+      log.d('[TradeUsecase] Threshold unchanged: $threshold');
+      return;
+    }
+    
+    final oldThreshold = _currentThreshold;
+    _currentThreshold = threshold;
+    
+    log.i('[TradeUsecase] Threshold updated: ${oldThreshold.toStringAsFixed(0)} → ${threshold.toStringAsFixed(0)}');
+    
+    // Repository에 업데이트 전달
     _repository.updateThreshold(threshold);
   }
-  
-  void dispose() {
-    _repository.dispose();
+
+  /// 📊 현재 설정 상태 조회
+  Map<String, dynamic> getCurrentState() {
+    return {
+      'currentThreshold': _currentThreshold,
+      'currentMarkets': _currentMarkets,
+      'activeSubscriptions': _activeSubscriptions.length,
+    };
+  }
+
+  /// ✅ [추가] 임계값 사전 검증
+  bool isValidThreshold(double threshold) {
+    return threshold >= 0 && threshold <= 1000000000; // 10억 USDT 이하
+  }
+
+  /// ✅ [추가] 마켓 목록 검증  
+  bool areValidMarkets(List<String> markets) {
+    return markets.isNotEmpty && 
+           markets.every((market) => market.isNotEmpty && market.contains('USDT'));
+  }
+
+  // ===================================================================
+  // 유틸리티 메서드들
+  // ===================================================================
+
+  /// 🎯 스트림을 Result로 래핑하는 StreamTransformer
+  StreamTransformer<T, Result<T, AppException>> _wrapStream<T>(String errorMsg) {
+    return StreamTransformer.fromHandlers(
+      handleData: (data, sink) {
+        sink.add(Ok(data));
+      },
+      handleError: (error, stackTrace, sink) {
+        final appException = error is AppException 
+            ? error 
+            : AppException.network('$errorMsg: $error');
+        
+        log.e('[TradeUsecase] Stream error: $errorMsg', error, stackTrace);
+        sink.add(Err(appException));
+      },
+    );
+  }
+
+  /// 🧹 리소스 정리
+  Future<void> dispose() async {
+    log.i('[TradeUsecase] Disposing... Current state: ${getCurrentState()}');
+    
+    // 활성 구독들 정리
+    for (final subscription in _activeSubscriptions.values) {
+      await subscription.cancel();
+    }
+    _activeSubscriptions.clear();
+    
+    // Repository 정리
+    await _repository.dispose();
+    
+    // 상태 초기화
+    _currentMarkets.clear();
+    
+    log.i('[TradeUsecase] Disposed successfully');
+  }
+}
+
+// ===================================================================
+// Result 확장 메서드들 (UseCase 전용)
+// ===================================================================
+
+extension ResultTradeExtensions<T, E> on Result<T, E> {
+  /// 조건에 맞는 데이터만 필터링
+  Result<T, E> mapWhere(bool Function(T) predicate, {required Result<T, E> Function() fallback}) {
+    return when(
+      ok: (data) => predicate(data) ? Ok(data) : fallback(),
+      err: (error) => Err(error),
+    );
   }
 }\n\n// ====== lib/domain/entities/trade.dart ======\n
 import 'package:equatable/equatable.dart';
 
+/// 바이낸스 스트림 타입 열거
+enum BinanceStreamType {
+  aggTrade,    // 집계 거래 데이터
+  ticker,      // 24시간 통계
+  bookTicker,  // 최고 호가
+  depth5,      // 5단계 호가창
+}
+
 class Trade extends Equatable {
   /// 심볼 (e.g., BTCUSDT)
   final String market;
-
+  
   /// 체결 가격
   final double price;
-
+  
   /// 체결 수량 (API 필드명 'q'에 맞춰 volume -> quantity로 변경)
   final double quantity;
-
+  
   /// 총 체결액 (price * quantity)
   final double totalValue; // total -> totalValue로 명확화
-
+  
   /// 매수 체결 여부
   final bool isBuy;
-
+  
   /// 체결 시각 (milliseconds from epoch)
   final int timestamp; // timestampMs -> timestamp로 간소화
-
+  
   /// 거래 고유 ID (Aggregate trade ID)
   final String tradeId; // id -> tradeId로 명확화
+  
+  /// ✅ [추가] 스트림 타입 구분
+  final BinanceStreamType streamType;
+  
+  /// ✅ [추가] 원본 JSON 데이터 (디버깅/확장용)
+  final Map<String, dynamic>? rawData;
 
   const Trade({
     required this.market,
@@ -407,16 +2922,18 @@ class Trade extends Equatable {
     required this.isBuy,
     required this.timestamp,
     required this.tradeId,
+    this.streamType = BinanceStreamType.aggTrade,
+    this.rawData,
   });
 
   /// UI에서 사용하기 편한 DateTime 객체
   DateTime get dateTime => DateTime.fromMillisecondsSinceEpoch(timestamp);
 
-  /// 바이낸스 선물 `aggTrade` 스트림 데이터로부터 Trade 객체 생성
-  factory Trade.fromBinance(Map<String, dynamic> json) {
+  /// ✅ [개선] 바이낸스 선물 `aggTrade` 스트림 데이터로부터 Trade 객체 생성
+  factory Trade.fromAggTrade(Map<String, dynamic> json) {
     final price = double.parse(json['p'].toString());
     final quantity = double.parse(json['q'].toString());
-
+    
     return Trade(
       market: json['s'] as String,
       price: price,
@@ -425,21 +2942,238 @@ class Trade extends Equatable {
       isBuy: !(json['m'] as bool), // isBuyerMaker(`m`)가 false일 때가 매수
       timestamp: json['T'] as int,
       tradeId: json['a'].toString(),
+      streamType: BinanceStreamType.aggTrade,
+      rawData: json,
     );
+  }
+
+  /// ✅ [추가] 바이낸스 `ticker` 스트림 데이터로부터 Trade 객체 생성
+  factory Trade.fromTicker(Map<String, dynamic> json) {
+    final lastPrice = double.parse(json['c'].toString());
+    final volume = double.parse(json['v'].toString());
+    final quoteVolume = double.parse(json['q'].toString());
+    
+    return Trade(
+      market: json['s'] as String,
+      price: lastPrice,
+      quantity: volume,
+      totalValue: quoteVolume,
+      isBuy: true, // ticker는 방향성 없음 - 기본값
+      timestamp: json['E'] as int, // Event time
+      tradeId: 'ticker_${json['s']}_${json['E']}', // 고유 ID 생성
+      streamType: BinanceStreamType.ticker,
+      rawData: json,
+    );
+  }
+
+  /// ✅ [추가] 바이낸스 `bookTicker` 스트림 데이터로부터 Trade 객체 생성
+  factory Trade.fromBookTicker(Map<String, dynamic> json) {
+    final bidPrice = double.parse(json['b'].toString());
+    final askPrice = double.parse(json['a'].toString());
+    final bidQty = double.parse(json['B'].toString());
+    final askQty = double.parse(json['A'].toString());
+    
+    // 중간가격을 price로 사용
+    final midPrice = (bidPrice + askPrice) / 2;
+    final avgQty = (bidQty + askQty) / 2;
+    
+    return Trade(
+      market: json['s'] as String,
+      price: midPrice,
+      quantity: avgQty,
+      totalValue: midPrice * avgQty,
+      isBuy: true, // bookTicker는 방향성 없음
+      timestamp: DateTime.now().millisecondsSinceEpoch, // bookTicker에는 timestamp 없음
+      tradeId: 'book_${json['s']}_${json['u']}', // updateId 사용
+      streamType: BinanceStreamType.bookTicker,
+      rawData: json,
+    );
+  }
+
+  /// ✅ [추가] 바이낸스 `depth5` 스트림 데이터로부터 Trade 객체 생성
+  factory Trade.fromDepth5(Map<String, dynamic> json, String symbol) {
+    final bids = json['bids'] as List;
+    final asks = json['asks'] as List;
+    
+    if (bids.isEmpty || asks.isEmpty) {
+      throw ArgumentError('Empty order book data');
+    }
+    
+    // 최고 매수/매도 호가
+    final bestBid = double.parse(bids[0][0].toString());
+    final bestAsk = double.parse(asks[0][0].toString());
+    final bidQty = double.parse(bids[0][1].toString());
+    final askQty = double.parse(asks[0][1].toString());
+    
+    // 스프레드 중간가격
+    final midPrice = (bestBid + bestAsk) / 2;
+    final avgQty = (bidQty + askQty) / 2;
+    
+    return Trade(
+      market: symbol,
+      price: midPrice,
+      quantity: avgQty,
+      totalValue: midPrice * avgQty,
+      isBuy: true, // depth는 방향성 없음
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      tradeId: 'depth_${symbol}_${json['lastUpdateId']}',
+      streamType: BinanceStreamType.depth5,
+      rawData: json,
+    );
+  }
+
+  /// ✅ [추가] 스트림 타입에 따른 팩토리 메서드 (통합 인터페이스)
+  factory Trade.fromBinanceStream({
+    required Map<String, dynamic> json,
+    required BinanceStreamType streamType,
+    String? symbol, // depth5용
+  }) {
+    switch (streamType) {
+      case BinanceStreamType.aggTrade:
+        return Trade.fromAggTrade(json);
+      case BinanceStreamType.ticker:
+        return Trade.fromTicker(json);
+      case BinanceStreamType.bookTicker:
+        return Trade.fromBookTicker(json);
+      case BinanceStreamType.depth5:
+        return Trade.fromDepth5(json, symbol ?? 'UNKNOWN');
+    }
+  }
+
+  /// ✅ [유지] 기존 호환성을 위한 fromBinance (aggTrade 기본값)
+  factory Trade.fromBinance(Map<String, dynamic> json) {
+    return Trade.fromAggTrade(json);
+  }
+
+  /// ✅ [추가] 스트림별 추가 정보 접근자들
+  
+  /// ticker 스트림 전용: 24시간 변동률
+  double? get priceChangePercent {
+    if (streamType != BinanceStreamType.ticker || rawData == null) return null;
+    return double.tryParse(rawData!['P']?.toString() ?? '');
+  }
+  
+  /// ticker 스트림 전용: 24시간 고가
+  double? get highPrice {
+    if (streamType != BinanceStreamType.ticker || rawData == null) return null;
+    return double.tryParse(rawData!['h']?.toString() ?? '');
+  }
+  
+  /// ticker 스트림 전용: 24시간 저가
+  double? get lowPrice {
+    if (streamType != BinanceStreamType.ticker || rawData == null) return null;
+    return double.tryParse(rawData!['l']?.toString() ?? '');
+  }
+  
+  /// bookTicker 스트림 전용: 최고 매수 호가
+  double? get bestBidPrice {
+    if (streamType != BinanceStreamType.bookTicker || rawData == null) return null;
+    return double.tryParse(rawData!['b']?.toString() ?? '');
+  }
+  
+  /// bookTicker 스트림 전용: 최고 매도 호가
+  double? get bestAskPrice {
+    if (streamType != BinanceStreamType.bookTicker || rawData == null) return null;
+    return double.tryParse(rawData!['a']?.toString() ?? '');
+  }
+  
+  /// bookTicker 스트림 전용: 스프레드
+  double? get spread {
+    final bid = bestBidPrice;
+    final ask = bestAskPrice;
+    if (bid == null || ask == null) return null;
+    return ask - bid;
+  }
+
+  /// ✅ [추가] 유틸리티 메서드들
+  
+  /// 스트림 타입별 표시용 문자열
+  String get streamTypeDisplayName {
+    switch (streamType) {
+      case BinanceStreamType.aggTrade:
+        return 'Trade';
+      case BinanceStreamType.ticker:
+        return '24h Stats';
+      case BinanceStreamType.bookTicker:
+        return 'Best Bid/Ask';
+      case BinanceStreamType.depth5:
+        return 'Order Book';
+    }
+  }
+  
+  /// 데이터 품질 확인
+  bool get isValidData {
+    return market.isNotEmpty && 
+           price > 0 && 
+           quantity >= 0 && 
+           timestamp > 0 &&
+           tradeId.isNotEmpty;
+  }
+  
+  /// 복사 메서드 (불변 객체 수정용)
+  Trade copyWith({
+    String? market,
+    double? price,
+    double? quantity,
+    double? totalValue,
+    bool? isBuy,
+    int? timestamp,
+    String? tradeId,
+    BinanceStreamType? streamType,
+    Map<String, dynamic>? rawData,
+  }) {
+    return Trade(
+      market: market ?? this.market,
+      price: price ?? this.price,
+      quantity: quantity ?? this.quantity,
+      totalValue: totalValue ?? this.totalValue,
+      isBuy: isBuy ?? this.isBuy,
+      timestamp: timestamp ?? this.timestamp,
+      tradeId: tradeId ?? this.tradeId,
+      streamType: streamType ?? this.streamType,
+      rawData: rawData ?? this.rawData,
+    );
+  }
+
+  /// 디버그용 상세 정보
+  Map<String, dynamic> toDebugMap() {
+    return {
+      'market': market,
+      'price': price,
+      'quantity': quantity,
+      'totalValue': totalValue,
+      'isBuy': isBuy,
+      'timestamp': timestamp,
+      'dateTime': dateTime.toIso8601String(),
+      'tradeId': tradeId,
+      'streamType': streamType.name,
+      'isValid': isValidData,
+      'hasRawData': rawData != null,
+    };
   }
 
   /// Equatable을 위한 설정. tradeId를 기준으로 객체의 동등성을 비교합니다.
   @override
-  List<Object> get props => [tradeId];
+  List<Object?> get props => [tradeId];
+  
+  @override
+  String toString() => 'Trade($market: $price × $quantity, ${streamType.name})';
 }\n\n// ====== lib/presentation/controllers/trade_controller.dart ======\n
+// ===================================================================
 // lib/presentation/controllers/trade_controller.dart
+// 현재 Provider 체제에 맞게 수정된 Trade Controller
+// ===================================================================
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/common/time_frame_types.dart';
 import '../../core/di/core_provider.dart';
 import '../../domain/entities/trade.dart';
+import '../../core/utils/logger.dart';
 
-// State 클래스는 변경 없음
+// ===================================================================
+// 📊 State 클래스 (기존 유지)
+// ===================================================================
+
 class TradeControllerState {
   final bool isLoading;
   final String? errorMessage;
@@ -472,10 +3206,14 @@ class TradeControllerState {
   }
 }
 
-// Controller 클래스 수정
+// ===================================================================
+// 🎯 Controller 클래스 (현재 체제에 맞게 수정)
+// ===================================================================
+
 class TradeController extends StateNotifier<TradeControllerState> {
   final Ref _ref;
-  // ✅ StreamSubscription -> ProviderSubscription 으로 변경
+  
+  // ✅ ProviderSubscription으로 구독 관리
   ProviderSubscription? _filteredTradesSub;
   ProviderSubscription? _rawStreamSub;
 
@@ -484,58 +3222,233 @@ class TradeController extends StateNotifier<TradeControllerState> {
           currentFilter: _ref.read(tradeFilterProvider),
           selectedFilterIndex: TradeFilter.values.indexOf(_ref.read(tradeFilterProvider)),
         )) {
+    log.d('[TradeController] Initializing controller...');
     _listenToTrades();
   }
 
+  // ===================================================================
+  // 🎧 스트림 구독 관리
+  // ===================================================================
+
   void _listenToTrades() {
-    // raw stream의 로딩/에러 상태를 감지
+    log.d('[TradeController] Setting up trade stream listeners...');
+
+    // 🎯 [수정] rawTradesProvider 스트림 구독 (로딩/에러 상태 감지)
     _rawStreamSub = _ref.listen<AsyncValue<Trade>>(
-      rawTradeStreamProvider,
+      rawTradesProvider,
       (previous, next) {
+        // 로딩 상태 변경 감지
         if (state.isLoading && !next.isLoading) {
+          log.d('[TradeController] Raw stream loading completed');
           state = state.copyWith(isLoading: false);
         }
+
+        // 에러 상태 처리
         if (next.hasError) {
-          state = state.copyWith(errorMessage: next.error.toString(), isLoading: false);
+          final errorMsg = next.error.toString();
+          log.e('[TradeController] Raw stream error: $errorMsg');
+          state = state.copyWith(
+            errorMessage: errorMsg,
+            isLoading: false,
+          );
+        }
+
+        // 성공적으로 데이터 수신 시 에러 메시지 클리어
+        if (next.hasValue && state.errorMessage != null) {
+          log.d('[TradeController] Raw stream recovered from error');
+          state = state.copyWith(errorMessage: null);
         }
       },
       fireImmediately: true,
     );
 
-    // 필터링된 최종 목록을 구독하여 UI에 표시할 trades를 업데이트
-    _filteredTradesSub = _ref.listen<List<Trade>>(
-      filteredTradesProvider, 
+    // 🎯 [수정] filteredTradesProvider 스트림 구독 (필터링된 거래 목록)
+    _filteredTradesSub = _ref.listen<AsyncValue<List<Trade>>>(
+      filteredTradesProvider,
       (previous, next) {
-        state = state.copyWith(trades: next, isLoading: false);
+        next.when(
+          data: (trades) {
+            log.d('[TradeController] Received ${trades.length} filtered trades');
+            state = state.copyWith(
+              trades: trades,
+              isLoading: false,
+              errorMessage: null,
+            );
+          },
+          loading: () {
+            // 이미 데이터가 있다면 로딩 상태로 변경하지 않음 (부드러운 UX)
+            if (state.trades.isEmpty) {
+              log.d('[TradeController] Filtered trades loading...');
+              state = state.copyWith(isLoading: true);
+            }
+          },
+          error: (error, stackTrace) {
+            final errorMsg = error.toString();
+            log.e('[TradeController] Filtered trades error: $errorMsg', error, stackTrace);
+            state = state.copyWith(
+              errorMessage: errorMsg,
+              isLoading: false,
+            );
+          },
+        );
       },
       fireImmediately: true,
     );
+
+    log.i('[TradeController] ✅ Trade stream listeners configured');
   }
 
+  // ===================================================================
+  // 🎛️ 필터 제어 메서드
+  // ===================================================================
+
+  /// 거래대금 필터 변경
   void setThreshold(TradeFilter newFilter) {
+    if (state.currentFilter == newFilter) {
+      log.d('[TradeController] Filter unchanged: ${newFilter.displayName}');
+      return;
+    }
+
+    log.i('[TradeController] 🔄 Filter change: ${state.currentFilter.displayName} → ${newFilter.displayName}');
+
+    // 🎯 Provider 상태 업데이트
     _ref.read(tradeFilterProvider.notifier).state = newFilter;
+
+    // 🎯 Controller 상태 업데이트
     state = state.copyWith(
       currentFilter: newFilter,
       selectedFilterIndex: TradeFilter.values.indexOf(newFilter),
+      isLoading: true, // 새 필터 적용 중 로딩 표시
     );
+
+    log.d('[TradeController] ✅ Filter updated to: ${newFilter.displayName} (${newFilter.value.toStringAsFixed(0)})');
   }
 
+  /// 다음 필터로 순환
+  void nextFilter() {
+    final currentIndex = state.selectedFilterIndex;
+    final nextIndex = (currentIndex + 1) % TradeFilter.values.length;
+    final nextFilter = TradeFilter.values[nextIndex];
+    
+    log.d('[TradeController] Cycling to next filter: $nextIndex');
+    setThreshold(nextFilter);
+  }
+
+  /// 이전 필터로 순환
+  void previousFilter() {
+    final currentIndex = state.selectedFilterIndex;
+    final prevIndex = (currentIndex - 1 + TradeFilter.values.length) % TradeFilter.values.length;
+    final prevFilter = TradeFilter.values[prevIndex];
+    
+    log.d('[TradeController] Cycling to previous filter: $prevIndex');
+    setThreshold(prevFilter);
+  }
+
+  // ===================================================================
+  // 📊 상태 조회 메서드
+  // ===================================================================
+
+  /// 사용 가능한 모든 필터 목록
   List<TradeFilter> get availableFilters => TradeFilter.values;
+
+  /// 현재 필터의 표시 이름
   String get currentFilterDisplayName => state.currentFilter.displayName;
+
+  /// 현재 필터의 거래대금 임계값
+  double get currentThreshold => state.currentFilter.value;
+
+  /// 현재 거래 수
+  int get currentTradeCount => state.trades.length;
+
+  /// 에러 상태 여부
+  bool get hasError => state.errorMessage != null;
+
+  /// 로딩 상태 여부 (실제 로딩 중이거나 에러가 없을 때)
+  bool get isActivelyLoading => state.isLoading && !hasError;
+
+  // ===================================================================
+  // 🔄 수동 새로고침 (필요시)
+  // ===================================================================
+
+  /// 수동으로 스트림 재구독 (문제 발생 시 복구용)
+  void refresh() {
+    log.i('[TradeController] 🔄 Manual refresh requested');
+    
+    // 기존 구독 해제
+    _filteredTradesSub?.close();
+    _rawStreamSub?.close();
+    
+    // 로딩 상태로 변경
+    state = state.copyWith(
+      isLoading: true,
+      errorMessage: null,
+    );
+    
+    // 스트림 재구독
+    _listenToTrades();
+  }
+
+  /// 에러 상태 클리어
+  void clearError() {
+    if (state.errorMessage != null) {
+      log.d('[TradeController] Clearing error state');
+      state = state.copyWith(errorMessage: null);
+    }
+  }
+
+  // ===================================================================
+  // 🧹 정리
+  // ===================================================================
 
   @override
   void dispose() {
-    // ✅ 구독 취소 방식을 .close()로 변경
+    log.d('[TradeController] Disposing controller...');
+    
+    // ✅ 구독 해제
     _filteredTradesSub?.close();
     _rawStreamSub?.close();
+    
+    log.i('[TradeController] ✅ Controller disposed');
     super.dispose();
   }
 }
 
-// Provider 정의는 변경 없음
+// ===================================================================
+// 🎯 Provider 정의 (autoDispose로 메모리 관리)
+// ===================================================================
+
 final tradeControllerProvider =
     StateNotifierProvider.autoDispose<TradeController, TradeControllerState>((ref) {
   return TradeController(ref);
+});
+
+// ===================================================================
+// 🎛️ 편의용 Provider들 (UI에서 쉽게 사용할 수 있도록)
+// ===================================================================
+
+/// 현재 거래 목록만 조회
+final currentTradesProvider = Provider.autoDispose<List<Trade>>((ref) {
+  return ref.watch(tradeControllerProvider.select((state) => state.trades));
+});
+
+/// 현재 필터 정보만 조회
+final currentFilterProvider = Provider.autoDispose<TradeFilter>((ref) {
+  return ref.watch(tradeControllerProvider.select((state) => state.currentFilter));
+});
+
+/// 로딩 상태만 조회
+final tradesLoadingProvider = Provider.autoDispose<bool>((ref) {
+  return ref.watch(tradeControllerProvider.select((state) => state.isLoading));
+});
+
+/// 에러 상태만 조회
+final tradesErrorProvider = Provider.autoDispose<String?>((ref) {
+  return ref.watch(tradeControllerProvider.select((state) => state.errorMessage));
+});
+
+/// Controller 인스턴스 직접 접근 (메서드 호출용)
+final tradeControllerNotifierProvider = Provider.autoDispose<TradeController>((ref) {
+  return ref.watch(tradeControllerProvider.notifier);
 });\n\n// ====== lib/presentation/pages/trade_page.dart ======\n
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';

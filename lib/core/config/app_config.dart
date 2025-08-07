@@ -274,6 +274,78 @@ class AppConfig {
     return totalRate;
   }
   
+  // ===================================================================
+  // 14. ✅ [추가] TradeAggregator 설정
+  // ===================================================================
+  
+  /// 거래 병합 시간 창 (밀리초)
+  /// aggTrade 스트림에서 연속된 거래를 하나로 병합할 때 사용하는 시간 창
+  static const int mergeWindowMs = 500;
+  
+  /// 스트림별 병합 전략 설정
+  static const Map<String, int> streamMergeWindows = {
+    'aggTrade': 500,     // 500ms 창으로 거래 병합
+    'ticker': 1000,      // 1초 창으로 ticker 데이터 throttling
+    'bookTicker': 100,   // 100ms 창으로 호가 업데이트
+    'depth5': 100,       // 100ms 창으로 호가창 업데이트
+    'depth': 50,         // 50ms 창 (고빈도 데이터)
+  };
+  
+  /// Aggregator flush 주기 (밀리초)
+  /// 대기 중인 거래들을 강제로 방출하는 주기
+  static const int aggregatorFlushIntervalMs = 500;
+  
+  /// Aggregator 최대 대기 거래 수 (메모리 보호)
+  static const int maxPendingTrades = 1000;
+  
+  /// 거래 병합 시 사용할 가격 계산 방식
+  static const String priceCalculationMethod = 'weightedAverage'; // 'simple', 'weightedAverage', 'last'
+  
+  /// ✅ [추가] 스트림별 즉시 처리 여부
+  static const Map<String, bool> streamImmediateProcessing = {
+    'aggTrade': false,    // 병합 후 처리
+    'ticker': true,       // 즉시 처리
+    'bookTicker': true,   // 즉시 처리 (호가는 실시간이 중요)
+    'depth5': true,       // 즉시 처리
+    'depth': false,       // 병합 후 처리 (너무 빠름)
+  };
+  
+  /// ✅ [추가] 디버그 모드에서 병합 로그 출력 여부
+  static const bool enableMergeLogging = true;
+  
+  /// ✅ [추가] 성능 통계 수집 여부
+  static const bool enableAggregatorStats = true;
+
+  // ===================================================================
+  // 15. ✅ [추가] TradeAggregator 유틸리티 메서드들
+  // ===================================================================
+  
+  /// 특정 스트림의 병합 창 시간 가져오기
+  static int getMergeWindowForStream(String streamName) {
+    for (final entry in streamMergeWindows.entries) {
+      if (streamName.contains(entry.key)) {
+        return entry.value;
+      }
+    }
+    return mergeWindowMs; // 기본값
+  }
+  
+  /// 특정 스트림이 즉시 처리되어야 하는지 확인
+  static bool shouldProcessImmediately(String streamName) {
+    for (final entry in streamImmediateProcessing.entries) {
+      if (streamName.contains(entry.key)) {
+        return entry.value;
+      }
+    }
+    return false; // 기본값: 병합 후 처리
+  }
+  
+  /// 가격 계산 방식에 따른 처리 로직 확인
+  static bool useWeightedAverage() {
+    return priceCalculationMethod == 'weightedAverage';
+  }
+
+
   /// ✅ [추가] 구독 안전성 검사
   static bool isSafeToSubscribe(List<String> streamNames) {
     final estimatedRate = estimateMessageRate(streamNames);

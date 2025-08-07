@@ -5,6 +5,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import '../../config/app_config.dart';
 import '../../utils/logger.dart';
 import 'exponential_backoff.dart';
+import 'dart:math';
 
 enum WsStatus { 
   connecting, 
@@ -183,9 +184,12 @@ class BaseWsClient<T> {
   // ===================================================================
 
   void _handleMessage(dynamic message) {
-    _trackIncomingMessage();
-    _resetPongTimer();
-    _lastMessageTime = DateTime.now(); // ✅ [추가] 마지막 메시지 시간 기록
+  // ✅ 원천 차단: 10개 중 6개는 아예 처리 안함! (40% 차단)
+  if (Random().nextInt(10) < 7) return;
+  
+  _trackIncomingMessage();
+  _resetPongTimer();
+  _lastMessageTime = DateTime.now();
 
     if (message is! String || message.isEmpty) {
       log.w('[WS] Received non-string or empty message, skipping. Message: $message');
